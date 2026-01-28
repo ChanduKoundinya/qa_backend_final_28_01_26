@@ -1,0 +1,28 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+- task: UsePythonVersion@0
+  inputs: { versionSpec: '3.11' }
+
+- script: |
+    python -m venv venv
+    source venv/bin/activate
+    pip install -r requirements.txt
+  displayName: 'Install dependencies'
+
+- task: ArchiveFiles@2
+  inputs:
+    rootFolderOrFile: '$(System.DefaultWorkingDirectory)'
+    includeRootFolder: false
+    archiveFile: '$(Build.ArtifactStagingDirectory)/backend.zip'
+
+- task: AzureWebApp@1
+  inputs:
+    azureSubscription: 'Your-Service-Connection'
+    appName: 'your-backend-app-service-name'
+    package: '$(Build.ArtifactStagingDirectory)/backend.zip'
+    appType: 'webAppLinux'

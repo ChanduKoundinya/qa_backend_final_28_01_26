@@ -1,0 +1,14 @@
+Flask
+Flask-Cors
+Flask-PyMongo
+pymongo
+python-dotenv
+APScheduler
+requests
+pytz
+pandas
+python-docx 
+matplotlib 
+seaborn
+flask-jwt-extended
+flask_apscheduler
