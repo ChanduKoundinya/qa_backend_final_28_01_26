@@ -17,7 +17,7 @@ def create_app():
 
     # 2. Initialize Extensions
     CORS(app, resources={r"/api/*": {
-    "origins": [ web_url ]
+    "origins": [ "https://proud-bush-04d9e660f.4.azurestaticapps.net" ]
 }},
          supports_credentials=True, 
          allow_headers=["Content-Type", "Authorization", "Access-Control-Allow-Credentials"])
