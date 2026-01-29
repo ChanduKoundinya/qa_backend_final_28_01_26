@@ -13,9 +13,11 @@ def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
 
+    web_url = app.config['WEB_URL']
+
     # 2. Initialize Extensions
     CORS(app, resources={r"/api/*": {
-    "origins": ["http://localhost:5173", "http://127.0.0.1:5173"]
+    "origins": [ web_url ]
 }},
          supports_credentials=True, 
          allow_headers=["Content-Type", "Authorization", "Access-Control-Allow-Credentials"])
