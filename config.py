@@ -7,6 +7,7 @@ load_dotenv()
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev_key")
     CORE_SERVICE_URL = os.getenv("CORE_SERVICE_URL")
+    WEB_URL = os.getenv("WEB_URL")
 
     # --- MongoDB Connection Logic ---
     MONGO_USERNAME = os.getenv("MONGO_USERNAME")
