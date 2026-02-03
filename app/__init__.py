@@ -17,10 +17,11 @@ def create_app():
 
     # 2. Initialize Extensions
     CORS(app, resources={r"/api/*": {
-    "origins": [ "https://proud-bush-04d9e660f.4.azurestaticapps.net" ]
+    "origins": ["https://witty-wave-0b6c9090f.4.azurestaticapps.net"]
 }},
-         supports_credentials=True, 
-         allow_headers=["Content-Type", "Authorization", "Access-Control-Allow-Credentials"])
+     supports_credentials=True, 
+     methods=["GET", "POST", "OPTIONS"], # Explicitly allow OPTIONS (Preflight)
+     allow_headers=["Content-Type", "Authorization", "Access-Control-Allow-Credentials"])
 
     app.config["JWT_SECRET_KEY"] = "super-secret-key-change-this-in-prod"
     

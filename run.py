@@ -8,6 +8,11 @@ app = create_app()
  
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # Set limit to 50MB
 
+@app.route('/')
+def health_check():
+    return "OK", 200
+
 if __name__ == '__main__':
     # You can also set debug=True, but basicConfig handles the logging
     app.run(debug=True, port=5000)
+
