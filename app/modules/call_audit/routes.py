@@ -1,17 +1,73 @@
 import json
 import logging
 import requests
+import threading
 from datetime import datetime
 from bson.objectid import ObjectId
-from flask import request, jsonify, current_app,send_file
+from flask import request, jsonify, current_app, send_file
 from . import call_audit_bp
 from app.extensions import mongo
 from app.engine.call_report import CallReportEngine
 import io
 import pandas as pd
 from flask_jwt_extended import jwt_required
+
 # ==========================================
-# 1. CORE AUDIT ENDPOINTS
+# 1. BACKGROUND WORKER LOGIC
+# ==========================================
+
+def run_audit_in_background(app, files_data, main_task_id_str, criteria_list, api_key, core_url):
+    """
+    Background worker that talks to the Core Service.
+    """
+    # 🟢 CRITICAL: Use the app context to access mongo and config
+    with app.app_context():
+        logging.info(f"🚀 Thread started for Task ID: {main_task_id_str}")
+        
+        for file_name, file_content, mimetype in files_data:
+            safe_key = file_name.replace('.', '_')
+            composite_id = f"{main_task_id_str}___{file_name}"
+            
+            try:
+                logging.info(f"🔄 Background Processing File: {file_name}")
+
+                # Prepare the file-like object from stored bytes
+                files_payload = {
+                    'audio_file': (file_name, io.BytesIO(file_content), mimetype)
+                }
+                data_payload = {
+                    'task_id': composite_id,
+                    'api_key': api_key,
+                    'criteria': json.dumps(criteria_list)
+                }
+
+                # 🟢 Call the Core Service with a long timeout
+                response = requests.post(core_url, files=files_payload, data=data_payload, timeout=14400)
+
+                if response.status_code == 200:
+                    logging.info(f"   ✅ Successfully sent '{file_name}' to Core.")
+                    mongo.db.tasks.update_one(
+                        {'_id': ObjectId(main_task_id_str)},
+                        {'$set': {f'files_tracker.{safe_key}.status': 'processing'}}
+                    )
+                else:
+                    logging.error(f"   ⚠️ Core Rejected '{file_name}' with status {response.status_code}: {response.text}")
+                    mongo.db.tasks.update_one(
+                        {'_id': ObjectId(main_task_id_str)},
+                        {'$set': {f'files_tracker.{safe_key}.status': 'error', f'files_tracker.{safe_key}.error': 'Core rejection'}}
+                    )
+
+            except Exception as e:
+                logging.error(f"   ❌ Thread Exception on '{file_name}': {str(e)}")
+                mongo.db.tasks.update_one(
+                    {'_id': ObjectId(main_task_id_str)},
+                    {'$set': {f'files_tracker.{safe_key}.status': 'error', f'files_tracker.{safe_key}.error': str(e)}}
+                )
+        
+        logging.info(f"🏁 Thread finished for Task ID: {main_task_id_str}")
+
+# ==========================================
+# 2. CORE AUDIT ENDPOINTS
 # ==========================================
 
 @call_audit_bp.route('/api/call/audit', methods=['POST'])
@@ -52,121 +108,60 @@ def upload_call_audit():
 
         core_url = current_app.config.get('CORE_SERVICE_URL') + "/internal/process-call"
 
-        # 3️⃣ CREATE ONE MASTER TASK (The "Files Tracker")
+        # 3️⃣ PRE-PROCESS FILES & CREATE TRACKER
         files_tracker = {}
+        files_to_thread = []  
+
         for f in files:
-            # 🟢 FIX: Sanitize key for MongoDB
             safe_key = f.filename.replace('.', '_')
             files_tracker[safe_key] = {"status": "queued", "error": None}
+            
+            # 🟢 CRITICAL: Read content into memory BEFORE returning the response
+            f.stream.seek(0)
+            content = f.read()
+            if len(content) > 0:
+                files_to_thread.append((f.filename, content, f.mimetype))
 
-        if len(files) == 1:
-            batch_name = files[0].filename
-        else:
-            # Example: "audio1.wav + 4 others"
-            batch_name = f"{files[0].filename} + {len(files)-1} others"
+        if not files_to_thread:
+            return jsonify({"error": "No valid file data found"}), 400
 
-        main_task_id = mongo.db.tasks.insert_one({
+        batch_name = files[0].filename if len(files) == 1 else f"{files[0].filename} + {len(files)-1} others"
+
+        # Create Task Document
+        inserted_id = mongo.db.tasks.insert_one({
             'type': 'call_audit_batch',
             'status': 'processing',
             'filename': batch_name, 
             'files_tracker': files_tracker, 
-            'total_files': len(files),
+            'total_files': len(files_to_thread),
             'completed_count': 0,
             'audit_category': 'call audit',
             'created_at': datetime.now(),
             'output_excel_id': None
         }).inserted_id
 
-        logging.info(f"🆔 Created Single Master Task: {main_task_id}")
+        main_task_id_str = str(inserted_id)
+        logging.info(f"🆔 Created Master Task: {main_task_id_str}")
 
-        # 4️⃣ LOOP & PROCESS
-        created_sub_tasks = []  # 🟢 RESTORED: To hold detailed success response
-        errors = []
+        # 4️⃣ START BACKGROUND THREAD
+        # current_app._get_current_object() is the most reliable way to pass the app to a thread
+        flask_app = current_app._get_current_object()
+        thread = threading.Thread(
+            target=run_audit_in_background,
+            args=(flask_app, files_to_thread, main_task_id_str, criteria_list, api_key, core_url)
+        )
+        thread.daemon = True # Ensure thread doesn't block server exit
+        thread.start()
 
-        for index, file in enumerate(files, start=1):
-            safe_key = file.filename.replace('.', '_')
-            
-            try:
-                logging.info(f"🔄 Processing {index}/{len(files)}: '{file.filename}'")
-
-                # --- A. Zero Byte Check ---
-                file.stream.seek(0, 2)
-                file_size = file.stream.tell()
-                file.stream.seek(0)
-                
-                if file_size == 0:
-                    error_msg = "Empty file (0 bytes)"
-                    logging.error(f"❌ {file.filename}: {error_msg}")
-                    errors.append({"filename": file.filename, "error": error_msg})
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {
-                            '$set': {f'files_tracker.{safe_key}.status': 'error'},
-                            '$inc': {'total_files': -1}
-                        }
-                    )
-                    continue
-
-                # --- B. Composite ID ---
-                composite_id = f"{main_task_id}___{file.filename}"
-
-                # --- C. Send to Core ---
-                current_files = {'audio_file': (file.filename, file.stream, file.mimetype)}
-                data = {
-                    'task_id': composite_id,
-                    'api_key': api_key,
-                    'criteria': json.dumps(criteria_list)
-                }
-
-                response = requests.post(core_url, files=current_files, data=data, timeout=14400)
-
-                if response.status_code == 200:
-                    logging.info(f"   ✅ Sent '{file.filename}' to Core.")
-                    
-                    # Update DB status
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'processing'}}
-                    )
-                    
-                    # 🟢 RESTORED: Add to response list
-                    created_sub_tasks.append({
-                        "filename": file.filename,
-                        "sub_task_id": composite_id, # Use Composite ID as the unique ref
-                        "status": "queued"
-                    })
-                else:
-                    logging.error(f"   ⚠️ Core Error: {response.text}")
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
-                    )
-                    errors.append({"filename": file.filename, "error": "Core rejected"})
-
-            except Exception as e:
-                logging.error(f"   ❌ Exception on '{file.filename}': {e}")
-                mongo.db.tasks.update_one(
-                    {'_id': main_task_id},
-                    {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
-                )
-                errors.append({"filename": file.filename, "error": str(e)})
-
-        # 5️⃣ RETURN DETAILED RESPONSE (Restored Format)
-        logging.info(f"🏁 Batch Complete. {len(created_sub_tasks)} queued, {len(errors)} failed.")
-
-        response_payload = {
-            "message": f"Processing started for {len(created_sub_tasks)} files.",
-            "task_id": str(main_task_id),
-            "sub_tasks": created_sub_tasks  # 🟢 RESTORED LIST
-        }
-
-        if errors:
-            response_payload["errors"] = errors
-
-        return jsonify(response_payload), 200 if created_sub_tasks else 500
+        # 5️⃣ RETURN IMMEDIATELY (Prevent UI Timeout)
+        return jsonify({
+            "message": f"Processing started for {len(files_to_thread)} files.",
+            "task_id": main_task_id_str,
+            "status": "accepted"
+        }), 202
 
     except Exception as e:
-        logging.error(f"❌ Critical Upload Error: {e}")
+        logging.error(f"❌ Critical Upload Error: {str(e)}")
         return jsonify({"error": str(e)}), 500
     
 
