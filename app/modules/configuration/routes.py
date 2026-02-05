@@ -1,12 +1,14 @@
 import pytz
+import requests
 from datetime import datetime
 from bson.objectid import ObjectId
 from flask import request, jsonify
 from app.extensions import mongo
+from flask import current_app
 from . import config_bp
 import logging
 from app.decorators import role_required
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt
 import uuid
 
 # --- API Configuration Routes (e.g. OpenAI Key) ---
@@ -241,25 +243,64 @@ def add_criterion():
         data = request.get_json()
         name = data.get('name', '').strip()
         weight = float(data.get('weight', 1.0))
-        criterion_type = data.get('type', '').strip().lower() # ✅ Capture Type
+        criterion_type = data.get('type', '').strip().lower() 
         user_role = data.get('role', 'System')
         description = data.get('description', '').strip() 
 
-        # 1. Validation
+        # 1. Validation (Basic)
         if not name: 
             return api_response(message='Name is required', status=400)
         
-        if criterion_type not in VALID_CRITERIA_TYPES: # ✅ Validate Type
+        if criterion_type not in VALID_CRITERIA_TYPES: 
             return api_response(
                 message=f'Invalid type. Must be one of: {", ".join(VALID_CRITERIA_TYPES)}', 
                 status=400
             )
 
+        # =========================================================
+        # 🟢 NEW: AI GUARDRAIL (Validate Name with Core Service)
+        # =========================================================
+        try:
+            # 1. Get API Key from the Default DB (mongo.db)
+            # We don't need 'mongo.cx' or 'db_name' here anymore.
+            config_doc = mongo.db.api_config.find_one({"name": "openai_api_key"})
+            api_key = config_doc.get('key') if config_doc else None
+
+            # 2. Get Core URL safely
+            base_url = current_app.config.get('CORE_SERVICE_URL')
+            
+            if api_key and base_url:
+                core_url = base_url.rstrip('/') + "/internal/validate-criteria"
+                
+                # Send HTTP Request
+                response = requests.post(core_url, json={
+                    "term": name,
+                    "api_key": api_key
+                }, timeout=3) 
+
+                if response.status_code == 200:
+                    result = response.json()
+                    # If AI says INVALID, block the request
+                    if not result.get('is_valid', True):
+                        return api_response(
+                            message=f"Criteria Rejected by AI: {result.get('reason')}", 
+                            status=400
+                        )
+                else:
+                    logging.warning(f"⚠️ Core Validation failed: {response.status_code}")
+            else:
+                if not base_url: logging.warning("⚠️ CORE_SERVICE_URL missing in Config.")
+                if not api_key: logging.warning("⚠️ OpenAI API Key missing in DB.")
+
+        except Exception as ai_error:
+            # Fail Open: Log it but allow the save
+            logging.error(f"⚠️ Core Validation Unreachable: {ai_error}")
+        # =========================================================
+
         # 2. Check for duplicates (Name + Type combination)
-        # We now allow "Grammar" to exist for BOTH "ticket audit" and "call audit"
         duplicate_check = {
             "name": {"$regex": f"^{name}$", "$options": "i"}, 
-            "type": criterion_type, # ✅ Scope check to this type
+            "type": criterion_type, 
             "is_active": True
         }
         
@@ -274,7 +315,7 @@ def add_criterion():
         new_crit = {
             "name": name, 
             "description": description,
-            "type": criterion_type, # ✅ Save Type
+            "type": criterion_type, 
             "weight": weight, 
             "is_active": True, 
             "created_at": now, 
