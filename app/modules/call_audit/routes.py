@@ -1,17 +1,20 @@
 import json
 import logging
 import requests
+import threading
 from datetime import datetime
 from bson.objectid import ObjectId
-from flask import request, jsonify, current_app,send_file
+from flask import request, jsonify, current_app, send_file
 from . import call_audit_bp
 from app.extensions import mongo
 from app.engine.call_report import CallReportEngine
 import io
 import pandas as pd
 from flask_jwt_extended import jwt_required
+
+
 # ==========================================
-# 1. CORE AUDIT ENDPOINTS
+# 2. CORE AUDIT ENDPOINTS
 # ==========================================
 
 import threading
@@ -69,12 +72,15 @@ def upload_call_audit():
 
         # 3️⃣ CREATE ONE MASTER TASK (DB Entry)
         files_tracker = {}
+        files_to_thread = []  
+
         for f in files:
             safe_key = f.filename.replace('.', '_')
             files_tracker[safe_key] = {"status": "queued", "error": None}
 
         batch_name = files[0].filename if len(files) == 1 else f"{files[0].filename} + {len(files)-1} others"
 
+        # Create Task Document
         main_task_id = mongo.db.tasks.insert_one({
             'type': 'call_audit_batch',
             'status': 'processing',
@@ -168,7 +174,7 @@ def upload_call_audit():
         }), 200
 
     except Exception as e:
-        logging.error(f"❌ Critical Upload Error: {e}")
+        logging.error(f"❌ Critical Upload Error: {str(e)}")
         return jsonify({"error": str(e)}), 500    
 
 @call_audit_bp.route('/internal/save-call-results', methods=['POST'])
