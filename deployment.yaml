@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: backend
-        image: qabot.azurecr.io/backend:v3
+        image: qabot.azurecr.io/backend:v4
         imagePullPolicy: Always
         ports:
         - containerPort: 8000
@@ -40,7 +40,7 @@ kind: Service
 metadata:
   name: backend-service
 spec:
-  type: LoadBalancer # This gives you a PUBLIC IP
+  type: ClusterIP  # <--- CHANGE THIS from LoadBalancer
   ports:
   - port: 80
     targetPort: 8000
