@@ -41,6 +41,8 @@ class CallReportEngine:
             # Prepare the row with base DB info
             row = {
                 "Call ID": doc.get("filename") or doc.get("task_id"),
+                "Agent Name": doc.get("agent_name", "Unknown"),       # <--- NEW
+                "Audit Date": doc.get("agent_audit_date", ""),
                 "Overall Score": doc.get("score") or ai_data.get("Overall Score") or ai_data.get("score"),
                 "Processed At": doc.get("created_at")
             }
@@ -55,7 +57,7 @@ class CallReportEngine:
             
             # 1. Try finding in user_info (Fastest)
             ticket_id = (
-                user_info.get("ticket_id") or 
+                user_info.get("ticket_id") or
                 user_info.get("Ticket ID") or 
                 user_info.get("TicketId") or 
                 user_info.get("incident_id") or
@@ -183,7 +185,7 @@ class CallReportEngine:
         df = pd.DataFrame(all_data)
 
         # 7. Column Sorting
-        fixed_cols = ["Call ID", "User Name", "User ID", "Ticket ID", "Overall Score", "Processed At", "Email", "Phone"]
+        fixed_cols = ["Call ID", "User Name", "User ID","Agent Name","Audit Date", "Ticket ID", "Overall Score", "Processed At", "Email", "Phone"]
         existing_fixed = [c for c in fixed_cols if c in df.columns]
         dynamic_cols = [c for c in df.columns if c not in existing_fixed]
         dynamic_cols.sort()
