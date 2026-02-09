@@ -11,6 +11,7 @@ from app.extensions import mongo
 from app.engine.call_report import CallReportEngine
 import io
 import pandas as pd
+import re
 from flask_jwt_extended import jwt_required
 
 
@@ -57,7 +58,6 @@ def parse_filename_metadata(filename):
             pass # Use None if date is invalid
 
     return agent_name, audit_date
-
 
 @call_audit_bp.route('/api/call/audit', methods=['POST'])
 @jwt_required()
@@ -214,17 +214,24 @@ def save_call_results():
         composite_id = request.form.get('task_id')
         audit_results_str = request.form.get('audit_results')
         
-        # 2. Split it back apart
-        if "___" in composite_id:
-            main_task_id, filename = composite_id.split("___", 1)
+        # 🟢 REVERTED: Old Logic (Split only into 2 parts)
+        # We assume the ID is just "task_id___filename"
+        if composite_id and "___" in composite_id:
+            try:
+                main_task_id, filename = composite_id.split("___", 1)
+            except ValueError:
+                return jsonify({"error": "Invalid Composite ID format (Expected task___file)"}), 400
         else:
-            return jsonify({"error": "Invalid Composite ID format"}), 400
+            return jsonify({"error": "Missing or Invalid task_id"}), 400
 
         # 3. Save Raw Data
         audit_data = json.loads(audit_results_str)
         result_item = audit_data[0] if isinstance(audit_data, list) else audit_data
+
+        # 🟢 KEEPING THE NEW REQUIREMENT: Extract Metadata
+        agent_name, agent_date = parse_filename_metadata(filename)
         
-        # Add filename context to the data
+        # Add context to the data object
         result_item['filename'] = filename 
 
         agent_name, agent_date = parse_filename_metadata(filename)
@@ -235,19 +242,21 @@ def save_call_results():
             "filename": filename,
             "agent_name": agent_name,       # <--- Saved
             "agent_audit_date": agent_date, # <--- Saved
+            "agent_name": agent_name,       # <--- Saved
+            "agent_audit_date": agent_date, # <--- Saved
             "full_data": result_item,
             "created_at": datetime.now()
         })
 
+        # --- The rest is standard tracking logic ---
+
         # 🟢 CRITICAL FIX: Sanitize filename for MongoDB Key (Replace . with _)
-        # This ensures 'audio.wav' becomes 'audio_wav' for the update path
         safe_tracker_key = filename.replace('.', '_')
 
         # 4. Update the Tracker in the Main Task
         updated_task = mongo.db.tasks.find_one_and_update(
             {'_id': ObjectId(main_task_id)},
             {
-                # Use the SAFE key here
                 '$set': {f'files_tracker.{safe_tracker_key}.status': 'complete'},
                 '$inc': {'completed_count': 1}
             },
@@ -255,37 +264,38 @@ def save_call_results():
         )
 
         # 5. Check if Batch is 100% Done
-        total = updated_task.get('total_files', 0)
-        done = updated_task.get('completed_count', 0)
-        
-        logging.info(f"📊 Progress for {main_task_id}: {done}/{total}")
+        if updated_task:
+            total = updated_task.get('total_files', 0)
+            done = updated_task.get('completed_count', 0)
+            
+            logging.info(f"📊 Progress for {main_task_id}: {done}/{total}")
 
-        if done >= total:
-            logging.info(f"🏁 Task {main_task_id} Complete! Generating Master Excel...")
-            
-            # A. Fetch ALL results
-            all_results = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
-            
-            # B. Generate Excel
-            engine = CallReportEngine()
-            excel_output = engine.generate_excel(all_results)
-            
-            # C. Save Excel and Update Main Task
-            filename_report = f"Master_Report_{main_task_id}.xlsx"
-            excel_id = current_app.fs.put(
-                excel_output, 
-                filename=filename_report,
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            
-            mongo.db.tasks.update_one(
-                {'_id': ObjectId(main_task_id)},
-                {'$set': {
-                    'status': 'complete', 
-                    'output_excel_id': excel_id,
-                    'completed_at': datetime.now()
-                }}
-            )
+            if done >= total:
+                logging.info(f"🏁 Task {main_task_id} Complete! Generating Master Excel...")
+                
+                # A. Fetch ALL results
+                all_results = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
+                
+                # B. Generate Excel
+                engine = CallReportEngine()
+                excel_output = engine.generate_excel(all_results)
+                
+                # C. Save Excel and Update Main Task
+                filename_report = f"Master_Report_{main_task_id}.xlsx"
+                excel_id = current_app.fs.put(
+                    excel_output, 
+                    filename=filename_report,
+                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+                
+                mongo.db.tasks.update_one(
+                    {'_id': ObjectId(main_task_id)},
+                    {'$set': {
+                        'status': 'complete', 
+                        'output_excel_id': excel_id,
+                        'completed_at': datetime.now()
+                    }}
+                )
 
         return jsonify({"status": "success"}), 200
 
@@ -400,3 +410,4 @@ def save_rules_only():
 #     except Exception as e:
 #         logging.error(f"❌ Download Error: {e}")
 #         return jsonify({"error": str(e)}), 500
+
