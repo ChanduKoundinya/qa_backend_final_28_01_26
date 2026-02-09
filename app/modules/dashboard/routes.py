@@ -8,10 +8,11 @@ from flask_pymongo import PyMongo
 from flask import Blueprint, request, jsonify
 from datetime import datetime
 import pymongo
-
+from flask_jwt_extended import jwt_required
 dashboard_bp = Blueprint('dashboard', __name__)
 
 @dashboard_bp.route('/api/combined-dashboard-summary')
+@jwt_required()
 def get_combined_dashboard_summary():
     """
     Unified Dashboard Summary
@@ -100,7 +101,7 @@ def get_combined_dashboard_summary():
                     }
                 }},
                 {"$group": {
-                    "_id": {"parameter": "$data_array.k", "status": {"$toString": "$data_array.v"}},
+                    "_id": {"parameter": "$data_array.k", "status": {"$toString": {"$ifNull": ["$data_array.v", "N/A"]}}},
                     "count": {"$sum": 1}
                 }},
                 {"$group": {
@@ -188,7 +189,7 @@ def get_combined_dashboard_summary():
                 {"$group": {
                     "_id": {
                         "parameter": "$full_data.Breakdown.Parameter",
-                        "status": {"$toString": "$full_data.Breakdown.Status"} 
+                        "status": {"$toString": {"$ifNull": ["$full_data.Breakdown.Status", "Unknown"]}}
                     },
                     "count": {"$sum": 1}
                 }},

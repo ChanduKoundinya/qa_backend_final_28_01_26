@@ -2,22 +2,25 @@ import os
 import urllib.parse
 from dotenv import load_dotenv
 
-load_dotenv()
+basedir = os.path.abspath(os.path.dirname(__file__))
+load_dotenv(os.path.join(basedir, '.env'), override=True)
+
 
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev_key")
     CORE_SERVICE_URL = os.getenv("CORE_SERVICE_URL")
     WEB_URL = os.getenv("WEB_URL")
 
-    # --- MongoDB Connection Logic ---
-    MONGO_USERNAME = os.getenv("MONGO_USERNAME")
-    MONGO_PASSWORD = os.getenv("MONGO_PASSWORD")
-    MONGO_HOSTNAME = os.getenv("MONGO_HOSTNAME")
-    DB_NAME = os.getenv("DB_NAME")
+    MONGO_URI_CENTRAL = os.getenv("MONGO_URI_CENTRAL")
 
-    if all([MONGO_USERNAME, MONGO_PASSWORD, MONGO_HOSTNAME, DB_NAME]):
-        encoded_password = urllib.parse.quote_plus(MONGO_PASSWORD)
-        MONGO_URI = f"mongodb+srv://{MONGO_USERNAME}:{encoded_password}@{MONGO_HOSTNAME}/{DB_NAME}?retryWrites=true&w=majority"
-    else:
-        # This will cause PyMongo to fail loudly if variables are missing, which is good
-        raise ValueError("Missing MongoDB configuration variables. App cannot start.")
+    # 🟢 FIX: Match the dictionary keys to your REAL project codes
+    TENANTS = {
+        "bcbsa": os.getenv("MONGO_URI_BCBSA"),       # Matches .env
+        "tuffs": os.getenv("MONGO_URI_TUFFS"),       # Matches .env
+        "project3": os.getenv("MONGO_URI_PROJECT3")  # Matches .env
+    }
+
+    # Debugging: Print to console on startup to verify (remove in production)
+    print(f"Loaded Tenants: {list(TENANTS.keys())}")
+    if None in TENANTS.values():
+        print("❌ CRITICAL ERROR: One or more Mongo URIs failed to load from .env!")

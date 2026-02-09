@@ -3,13 +3,13 @@ import logging
 import requests
 from datetime import datetime
 from bson.objectid import ObjectId
-from flask import request, jsonify, current_app,send_file
+from flask import request, jsonify, current_app,send_file, g
 from . import call_audit_bp
 from app.extensions import mongo
 from app.engine.call_report import CallReportEngine
 import io
 import pandas as pd
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt
 # ==========================================
 # 1. CORE AUDIT ENDPOINTS
 # ==========================================
@@ -34,6 +34,11 @@ def upload_call_audit():
 
         if not files:
             return jsonify({"error": "No audio files provided"}), 400
+        
+        claims = get_jwt()
+        project_code = claims.get('project')
+        if not project_code:
+             return jsonify({"error": "Project context missing in token"}), 400
 
         # 2️⃣ PREPARE COMMON DATA
         criteria_list = list(mongo.db.criteria.find(
@@ -50,8 +55,7 @@ def upload_call_audit():
         if not api_key:
             return jsonify({"error": "OpenAI Key not configured"}), 500
 
-        core_url = current_app.config.get('CORE_SERVICE_URL') + "/internal/process-call"
-
+        core_url = current_app.config.get('CORE_SERVICE_URL', "http://127.0.0.1:5001") + "/internal/process-call"
         # 3️⃣ CREATE ONE MASTER TASK (The "Files Tracker")
         files_tracker = {}
         for f in files:
@@ -108,7 +112,7 @@ def upload_call_audit():
                     continue
 
                 # --- B. Composite ID ---
-                composite_id = f"{main_task_id}___{file.filename}"
+                composite_id = f"{project_code}___{main_task_id}___{file.filename}"
 
                 # --- C. Send to Core ---
                 current_files = {'audio_file': (file.filename, file.stream, file.mimetype)}
@@ -179,7 +183,18 @@ def save_call_results():
         
         # 2. Split it back apart
         if "___" in composite_id:
-            main_task_id, filename = composite_id.split("___", 1)
+            try:
+                parts = composite_id.split("___", 2) # Split into max 3 parts
+                if len(parts) == 3:
+                    project_code, main_task_id, filename = parts
+                    
+                    # 🟢 ACTIVATE TENANT DB
+                    g.current_tenant = project_code
+                    logging.info(f"🔓 Passport Accepted: Saving Call Result to {project_code}")
+                else:
+                    return jsonify({"error": "Invalid Composite ID structure"}), 400
+            except ValueError:
+                return jsonify({"error": "Error parsing ID"}), 400
         else:
             return jsonify({"error": "Invalid Composite ID format"}), 400
 
