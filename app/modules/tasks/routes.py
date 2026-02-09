@@ -7,7 +7,7 @@ from bson.errors import InvalidId
 import gridfs
 import json
 import ast
-from flask import request, jsonify, send_file, current_app
+from flask import request, jsonify, send_file, current_app, g
 import pandas as pd
 from app.engine.incident import generate_incident_report
 import tempfile  # <--- Needed for temp file generation
@@ -18,7 +18,7 @@ from . import tasks_bp
 import io
 import re
 
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt
 
 def api_response(data=None, message="", status=200):
     return jsonify({
@@ -29,7 +29,7 @@ def api_response(data=None, message="", status=200):
     
 # --- BACKGROUND JOB (The Trigger) ---
 # --- BACKGROUND JOB (The Trigger) ---
-def run_scheduled_job(task_id, app_instance, features=None):
+def run_scheduled_job(task_id, app_instance, project_code, features=None):
     """
     Hybrid Trigger: 
     - If 'incident_report': Runs LOCALLY on Backend.
@@ -37,8 +37,12 @@ def run_scheduled_job(task_id, app_instance, features=None):
     """
     with app_instance.app_context():
         # --- Common Setup ---
+
+        g.current_tenant = project_code
+
         try:
             # 1. Status Tracking
+            logging.info(f"⚙️ Running Task {task_id} for Project: {project_code}")
             mongo.db.tasks.update_one(
                 {'_id': ObjectId(task_id)}, 
                 {'$set': {'status': 'processing'}}
@@ -162,9 +166,11 @@ def run_scheduled_job(task_id, app_instance, features=None):
             grid_out = current_app.fs.get(ObjectId(task['input_file_id']))
             files = {'file': (task['filename'], grid_out, 'text/csv')}
 
+            passport_task_id = f"{project_code}___{task_id}"
+
             # 7. Prepare Final Payload
             data = {
-                'task_id': task_id,
+                'task_id': passport_task_id,
                 'criteria': str(criteria),        # ✅ Correct Filtered Rules
                 'analysis_type': analysis_mode,   # ✅ Correct Output Mode
                 'audit_category': audit_category, # ✅ Pass Category context
@@ -175,7 +181,7 @@ def run_scheduled_job(task_id, app_instance, features=None):
 
             # --- 🔴 END OF NEW LOGIC INSERTION 🔴 ---
 
-            logging.info(f"🚀 Sending Task {task_id} payload to Core...")
+            logging.info(f"🚀 Sending Task {task_id} (Passport: {passport_task_id}) to Core...")
 
             response = requests.post(core_url, files=files, data=data, timeout=14400)
 
@@ -236,6 +242,14 @@ def upload_file():
 
         if not audit_category or not isinstance(audit_category, str) or len(audit_category.strip()) == 0:
              return api_response(message="Invalid or missing auditCategory.", status=400)
+        #-----------------------------------------------------------------------------------
+        claims = get_jwt()
+        current_project = claims.get('project')
+        username = claims.get("username", "Unknown User") 
+        
+        if not current_project:
+            return api_response(message="Project context missing in token", status=400)
+        #-----------------------------------------------------------------------------------
 
         # ---------------------------------------------------------
         # 🕒 IMPROVED SCHEDULING LOGIC (From your "Below" Code)
@@ -270,7 +284,8 @@ def upload_file():
                 "analysis_type": analysis_type,   
                 "audit_category": audit_category, 
                 "created_at": datetime.now(),
-                "scheduled_for": run_date
+                "scheduled_for": run_date,
+                "created_by": username
             }
             
             task_result = mongo.db.tasks.insert_one(task)
@@ -284,14 +299,14 @@ def upload_file():
         try:
             real_app_object = current_app._get_current_object()
             
-            # 🟢 FIX: Use explicit keyword arguments for 'id' and 'func'
             scheduler.add_job(
-                id=task_id,                  # 1. ID comes first (or use keyword like this)
-                func=run_scheduled_job,      # 2. The function to run
-                trigger='date',              # 3. Trigger type
-                run_date=run_date,           # 4. When to run
-                args=[task_id, real_app_object, None], # 5. Arguments
-                replace_existing=True,       # 6. Safety parameters
+                id=task_id,
+                func=run_scheduled_job,
+                trigger='date',
+                run_date=run_date,
+                # 🟢 PASS 'current_project' AS THE 3RD ARGUMENT
+                args=[task_id, real_app_object, current_project, None], 
+                replace_existing=True,
                 misfire_grace_time=60
             )
             
@@ -419,6 +434,9 @@ def api_get_tasks():
                     category = 'ticket_audit'
                 else:
                     category = task.get('type') or 'unknown'
+            
+            created_at_raw = task.get('created_at')
+            formatted_time = created_at_raw.strftime('%Y-%m-%d %H:%M:%S') if created_at_raw else "N/A"
 
             tasks_list.append({
                 '_id': str(task['_id']),
@@ -426,6 +444,8 @@ def api_get_tasks():
                 'status': task.get('status'),
                 'audit_category': category,
                 'analysis_type': task.get('analysis_type'),
+                'uploaded_by': task.get('created_by', 'System/Unknown'), # Fallback for old tasks
+                'uploaded_at': formatted_time,                           # Renamed for clarity, or keep 'created_at'
                 'created_at': task.get('created_at').strftime('%Y-%m-%d') if task.get('created_at') else None,
                 'output_excel_id': str(task.get('output_excel_id')) if task.get('output_excel_id') else None,
                 'output_docx_id': str(task.get('output_docx_id')) if task.get('output_docx_id') else None
@@ -524,9 +544,32 @@ def save_audit_results():
     """
     try:
         # 🟢 RISK MITIGATION: Validation Checks at Start
-        task_id = request.form.get('task_id')
+        raw_id = request.form.get('task_id')
         results_str = request.form.get('audit_results')
         analysis_type = request.form.get('analysis_type', 'score_only') 
+
+        if not raw_id: 
+            return jsonify({"error": "Missing task_id"}), 400
+        
+        task_id = raw_id # Default fallback
+        if "___" in raw_id:
+            try:
+                # Split: "bcbsa___64f2..." -> project_code="bcbsa", task_id="64f2..."
+                project_code, real_task_id = raw_id.split("___", 1)
+                
+                # MANUALLY ACTIVATE THE CORRECT DB
+                g.current_tenant = project_code 
+                task_id = real_task_id # Use the real ObjectId for DB lookups
+                
+                logging.info(f"🔓 Passport Accepted: Context switched to {project_code}")
+            except ValueError:
+                logging.error("❌ Invalid Passport ID format")
+                return jsonify({"error": "Invalid ID format"}), 400
+        else:
+            # If we get here, it means we received a result but don't know which DB it belongs to.
+            # This is a critical failure state for multi-tenancy.
+            logging.error("❌ Received Result without Project Context (No Passport).")
+            return jsonify({"error": "Missing Project Context in ID"}), 400
 
         if not task_id: 
             logging.error("❌ Save Results Failed: Missing task_id")
@@ -650,6 +693,10 @@ def upload_incident_report():
         
         if file.filename == '': 
             return api_response(message='No file selected', status=400)
+        
+        # 🟢 GET CURRENT PROJECT
+        claims = get_jwt()
+        current_project = claims.get('project')
 
         # 2. Encryption Check
         file_pos = file.tell()
@@ -718,14 +765,15 @@ def upload_incident_report():
             real_app = current_app._get_current_object()
             
             scheduler.add_job(
-                id=task_id,                # 🟢 Bind Job ID to Task ID
-                func=run_scheduled_job,    # 🟢 Explicit func arg
+                id=task_id,
+                func=run_scheduled_job,
                 trigger='date',
                 run_date=datetime.now(),
-                args=[task_id, real_app], 
+                # 🟢 PASS 'current_project' HERE TOO
+                args=[task_id, real_app, current_project], 
                 kwargs={'features': feats},
                 replace_existing=True,
-                misfire_grace_time=60      # 🟢 Allow late start
+                misfire_grace_time=60
             )
         except Exception as sched_e:
             logging.error(f"❌ Scheduler Error: {sched_e}")
@@ -741,3 +789,124 @@ def upload_incident_report():
     except Exception as e:
         logging.error(f"Incident Upload Error: {e}")
         return api_response(message=f"Internal Server Error: {str(e)}", status=500)
+
+# 🟢 NEW ENDPOINT: Receive PII Logs from Core Service
+@tasks_bp.route('/internal/save-pii-logs', methods=['POST'])
+def save_pii_logs():
+    """
+    Receives PII logs from Core Service and saves them to MongoDB.
+    """
+    try:
+        # 1. Get JSON Data
+        log_entry = request.get_json()
+        
+        if not log_entry:
+            return jsonify({"error": "No data provided"}), 400
+
+        raw_task_id = log_entry.get('task_id')
+        
+        if not raw_task_id:
+            return jsonify({"error": "Missing task_id"}), 400
+
+        # =========================================================
+        # 🟢 FIX: PASSPORT LOGIC (CONTEXT SWITCH)
+        # =========================================================
+        # We must tell mongo.db WHICH database to use based on the Project Code
+        if "___" in raw_task_id:
+            try:
+                # Split: "bcbsa___64f2..." -> project_code="bcbsa", task_id="64f2..."
+                project_code, real_task_id = raw_task_id.split("___", 1)
+                
+                # 🟢 ACTIVATE THE DB CONNECTION
+                g.current_tenant = project_code 
+                
+                # Update the log entry to store the clean ObjectId, not the long passport string
+                log_entry['task_id'] = real_task_id
+                
+            except ValueError:
+                logging.error("❌ Invalid PII Task ID format")
+                return jsonify({"error": "Invalid ID format"}), 400
+        else:
+            # Fallback if no passport provided (might fail if your app requires tenancy)
+            logging.warning("⚠️ PII Log received without Project Context (No Passport). mongo.db might be None.")
+        # =========================================================
+
+        logging.info(f"🛡️ Saving PII Log for Task {log_entry.get('task_id')}")
+
+        # 3. Insert into 'pii_logs' collection
+        # Now that g.current_tenant is set, mongo.db is no longer None
+        mongo.db.pii_logs.insert_one(log_entry)
+
+        return jsonify({"status": "success", "message": "PII Log Saved"}), 200
+
+    except Exception as e:
+        logging.error(f"❌ Failed to save PII Log: {e}")
+        return jsonify({"error": str(e)}), 500
+# app/modules/task/routes.py
+
+@tasks_bp.route('/api/pii-logs', methods=['GET'])
+@jwt_required()
+def get_pii_logs():
+    """
+    Retrieves PII audit logs with optional filtering.
+    Query Params:
+      - start_date (YYYY-MM-DD): Filter logs on or after this date.
+      - end_date (YYYY-MM-DD): Filter logs on or before this date.
+      - task_id (str): Filter by specific task.
+      - limit (int): Max records to return (default 50).
+    """
+    try:
+        # 1. Get Query Parameters
+        start_date_str = request.args.get('start_date')
+        end_date_str = request.args.get('end_date')
+        task_id = request.args.get('task_id')
+        limit = int(request.args.get('limit', 50)) # Default to 50 to prevent huge payloads
+
+        query = {}
+
+        # 2. Build Date Filter (String Comparison for ISO Dates)
+        if start_date_str or end_date_str:
+            date_query = {}
+            
+            if start_date_str:
+                # "2026-01-28" becomes "2026-01-28T00:00:00" (Start of day)
+                date_query['$gte'] = f"{start_date_str}T00:00:00"
+            
+            if end_date_str:
+                # "2026-01-28" becomes "2026-01-28T23:59:59" (End of day)
+                date_query['$lte'] = f"{end_date_str}T23:59:59"
+            
+            if date_query:
+                query['timestamp'] = date_query
+
+        # 3. Optional Task Filter
+        if task_id:
+            query['task_id'] = task_id
+
+        # 4. Execute Query
+        # Sort by timestamp DESC (-1) to show newest logs first
+        cursor = mongo.db.pii_logs.find(query).sort("timestamp", -1).limit(limit)
+
+        logs = []
+        for doc in cursor:
+            logs.append({
+                "id": str(doc['_id']),
+                "task_id": doc.get('task_id'),
+                "timestamp": doc.get('timestamp'),
+                "status": doc.get('status'),
+                "pii_found": doc.get('pii_found', False),
+                "stats": doc.get('detection_stats', {}),
+                # We rename 'processed_data_preview' to 'data' for the frontend
+                "data": doc.get('processed_data_preview') 
+            })
+
+        return jsonify({
+            "status": "success",
+            "count": len(logs),
+            "filters": {"start": start_date_str, "end": end_date_str},
+            "data": logs
+        }), 200
+
+    except Exception as e:
+        logging.error(f"❌ Error fetching PII logs: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
