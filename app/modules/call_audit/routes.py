@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import requests
 import threading
 from datetime import datetime
@@ -28,6 +29,35 @@ from flask import request, jsonify, current_app
 from flask_jwt_extended import jwt_required
 from . import call_audit_bp
 from app.extensions import mongo
+
+def parse_filename_metadata(filename):
+    """
+    Extracts Agent Name and Date from format:
+    "[Aswin Srinivasan]_101-+12106017188_20251229082336(2830).wav"
+    """
+    agent_name = "Unknown"
+    audit_date = None
+
+    # 1. Extract Name: Content inside [ ] at the start
+    # r"^\[([^\]]+)\]" -> Starts with [, capture anything not ], ends with ]
+    name_match = re.search(r"^\[([^\]]+)\]", filename)
+    if name_match:
+        agent_name = name_match.group(1)
+
+    # 2. Extract Date: Look for YYYYMMDD pattern (8 digits) followed by HHMMSS (6 digits)
+    # This is specific to your timestamp format "20251229082336"
+    date_match = re.search(r"(\d{8})\d{6}", filename)
+    if date_match:
+        raw_date = date_match.group(1) # e.g., "20251229"
+        try:
+            # Convert "20251229" -> "2025-12-29"
+            dt_obj = datetime.strptime(raw_date, "%Y%m%d")
+            audit_date = dt_obj.strftime("%Y-%m-%d")
+        except ValueError:
+            pass # Use None if date is invalid
+
+    return agent_name, audit_date
+
 
 @call_audit_bp.route('/api/call/audit', methods=['POST'])
 @jwt_required()
@@ -197,9 +227,14 @@ def save_call_results():
         # Add filename context to the data
         result_item['filename'] = filename 
 
+        agent_name, agent_date = parse_filename_metadata(filename)
+
+
         mongo.db.call_audit_results.insert_one({
-            "task_id": main_task_id, 
+             "task_id": main_task_id, 
             "filename": filename,
+            "agent_name": agent_name,       # <--- Saved
+            "agent_audit_date": agent_date, # <--- Saved
             "full_data": result_item,
             "created_at": datetime.now()
         })
