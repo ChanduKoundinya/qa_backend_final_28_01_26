@@ -13,3 +13,4 @@ seaborn
 flask-jwt-extended
 flask_apscheduler
 xlsxwriter
+spacy
