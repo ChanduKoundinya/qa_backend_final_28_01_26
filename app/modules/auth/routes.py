@@ -1,4 +1,5 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, g
+from config import Config
 from app.extensions import mongo, jwt  # Assuming you init JWTManager in extensions
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
@@ -10,85 +11,91 @@ from flask_jwt_extended import (
 )
 from datetime import datetime, timedelta
 
+
 auth_bp = Blueprint('auth', __name__)
 
-# --- 1. REGISTER ENDPOINT ---
 @auth_bp.route('/register', methods=['POST'])
 def register():
-    """
-    Creates a new user with a specific role.
-    Payload: { "username": "John", "email": "john@test.com", "password": "123", "role": "admin" }
-    """
     try:
         data = request.get_json()
         
-        # 1. Validate Input
-        required_fields = ['username', 'email', 'password', 'role']
-        if not all(field in data for field in required_fields):
-            return jsonify({"error": "Missing required fields"}), 400
+        # 1. Validation
+        # 'project' is still required so we know where to assign them!
+        required = ['username', 'email', 'password', 'role', 'project']
+        if not all(k in data for k in required):
+            return jsonify({"error": "Missing fields"}), 400
 
-        # 2. Check if user already exists
-        if mongo.db.users.find_one({"email": data['email']}):
+        project_code = data['project']
+
+        # 🟢 Validate Project Code exists in our System
+        # We don't want to assign a user to a database that doesn't exist.
+        if project_code not in Config.TENANTS:
+             return jsonify({"error": "Invalid Project Code provided"}), 400
+
+        # 2. Check Central DB for duplicates
+        # We use mongo.central_db now!
+        if mongo.central_db.users.find_one({"email": data['email']}):
             return jsonify({"error": "Email already registered"}), 409
 
-        # 3. Hash Password (NEVER save plain text passwords)
         hashed_password = generate_password_hash(data['password'])
 
-        # 4. Create User Document
+        # 3. Save to CENTRAL DB
         new_user = {
             "username": data['username'],
             "email": data['email'],
             "password": hashed_password,
-            "role": data['role'],  # e.g., 'admin', 'auditor', 'viewer'
+            "role": data['role'],
+            "project": project_code, # Storing the link here
             "created_at": datetime.utcnow()
         }
+        
+        mongo.central_db.users.insert_one(new_user)
 
-        # 5. Save to MongoDB
-        mongo.db.users.insert_one(new_user)
-
-        return jsonify({"message": "User created successfully"}), 201
+        return jsonify({"message": "User registered in Central Auth system"}), 201
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
-# --- 2. LOGIN ENDPOINT ---
 @auth_bp.route('/login', methods=['POST'])
 def login():
-    """
-    Authenticates user and returns a JWT token.
-    Payload: { "email": "john@test.com", "password": "123" }
-    """
     try:
         data = request.get_json()
-
-        # 1. Find User by Email
-        user = mongo.db.users.find_one({"email": data.get('email')})
+        
+        # 🟢 NOTICE: We DO NOT need 'project' in the request anymore!
+        # The user just provides Email + Password.
+        
+        # 1. Find User in Central DB
+        user = mongo.central_db.users.find_one({"email": data.get('email')})
 
         if not user:
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # 2. Verify Password
         if not check_password_hash(user['password'], data.get('password')):
             return jsonify({"error": "Invalid credentials"}), 401
 
-        # 3. Generate JWT Token
-        # We embed the user ID and ROLE into the token so the frontend knows permissions immediately.
-        # Identity identifies *who* they are. Additional claims identify *what* they are.
+        # 2. Retrieve their assigned Project from the DB document
+        user_project = user.get('project')
+        
+        if not user_project:
+             return jsonify({"error": "User account corrupted: No project assigned"}), 500
+
+        # 3. Generate Token WITH PROJECT CLAIM
+        # The rest of your app (Tasks, Audits) relies on this token claim.
+        # Since we put it here, the rest of the app "just works" without changes.
         access_token = create_access_token(
             identity=str(user['_id']), 
-            additional_claims={"role": user['role'], "username": user['username']},
-            expires_delta=timedelta(hours=12) # Token valid for 12 hours
+            additional_claims={
+                "role": user['role'], 
+                "project": user_project, # <--- We pulled this from Central DB
+                "username": user['username']
+            }
         )
 
-        return jsonify({
+        return jsonify({ 
             "message": "Login successful",
             "access_token": access_token,
-            "user": {
-                "username": user['username'],
-                "email": user['email'],
-                "role": user['role']
-            }
+            "project": user_project # Optional: Let frontend know where they landed
         }), 200
 
     except Exception as e:

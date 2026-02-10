@@ -1,8 +1,10 @@
 import logging
-import gridfs
+#import gridfs
 from flask import Flask
 from datetime import datetime
-from .extensions import mongo, cors, scheduler, jwt
+from werkzeug.local import LocalProxy  # 🟢 1. ADD THIS IMPORT
+from pymongo import MongoClient        # 🟢 2. ADD THIS (for startup cleanup only)
+from .extensions import mongo, cors, scheduler, jwt, get_fs # 🟢 3. IMPORT get_fs
 from config import Config
 from flask_cors import CORS
 
@@ -25,12 +27,12 @@ def create_app():
     app.config["JWT_SECRET_KEY"] = "super-secret-key-change-this-in-prod"
     
     try:
-        mongo.init_app(app)
-        with app.app_context():
-            mongo.cx.server_info()
-        logging.info("✅ Connected to MongoDB.")
+        # This now calls our custom MultiTenantMongo.init_app
+        mongo.init_app(app) 
+        logging.info("✅ Multi-Tenant MongoDB Manager Initialized.")
     except Exception as e:
-        logging.error(f"❌ Failed to connect to MongoDB: {e}")
+        logging.error(f"❌ Failed to initialize MongoDB: {e}")
+
 
     # 3. Initialize & Start Scheduler
     scheduler.init_app(app)
@@ -42,39 +44,54 @@ def create_app():
 
     # 4. Initialize GridFS & Cleanup
     with app.app_context():
-        app.fs = gridfs.GridFS(mongo.db)
+        # 🟢 CHANGE 1: DYNAMIC GRIDFS
+        # We replace the static GridFS with our LocalProxy wrapper.
+        # This ensures 'current_app.fs' always points to the correct tenant's storage.
+        app.fs = LocalProxy(get_fs)
         
         # =========================================================
-        # 🧹 SMART ZOMBIE TASK CLEANUP (Corrected)
+        # 🧹 SMART ZOMBIE TASK CLEANUP (MULTI-TENANT VERSION)
         # =========================================================
+        # Since 'mongo.db' relies on a logged-in user (which doesn't exist during startup),
+        # we must manually loop through all tenants to clean them up.
         
-        # 1. Kill 'queued' or 'processing' tasks
-        # These should be running NOW. If the server is restarting, they are dead.
-        result_active = mongo.db.tasks.update_many(
-            {'status': {'$in': ['queued', 'processing']}},
-            {'$set': {'status': 'error', 'error_message': 'System restarted while active.'}}
-        )
+        tenants = app.config.get('TENANTS', {})
+        
+        if not tenants:
+            logging.warning("⚠️ No tenants found in configuration for cleanup.")
+        
+        for project_code, uri in tenants.items():
+            try:
+                # Create a temporary connection just for this cleanup task
+                # We use a context manager to ensure it closes immediately after
+                with MongoClient(uri) as client:
+                    db = client.get_database()
+                    logging.info(f"🧹 Checking Project: {project_code}...")
 
-        # 2. Kill 'scheduled' tasks ONLY if they are in the PAST
-        # This preserves valid future tasks.
-        result_scheduled = mongo.db.tasks.update_many(
-            {
-                'status': 'scheduled',
-                'scheduled_for': {'$lt': datetime.now()} # Only clean if time < now
-            },
-            {'$set': {'status': 'error', 'error_message': 'System restarted and missed schedule.'}}
-        )
-        
-        # Logging results
-        total_cleaned = result_active.modified_count + result_scheduled.modified_count
-        if total_cleaned > 0:
-            logging.warning(f"🧹 Cleaned up {total_cleaned} zombie tasks ({result_active.modified_count} active, {result_scheduled.modified_count} missed schedule).")
-        else:
-            logging.info("✅ No zombie tasks found.")
+                    # 1. Kill 'queued' or 'processing' tasks
+                    result_active = db.tasks.update_many(
+                        {'status': {'$in': ['queued', 'processing']}},
+                        {'$set': {'status': 'error', 'error_message': 'System restarted while active.'}}
+                    )
+
+                    # 2. Kill 'scheduled' tasks ONLY if they are in the PAST
+                    result_scheduled = db.tasks.update_many(
+                        {
+                            'status': 'scheduled',
+                            'scheduled_for': {'$lt': datetime.now()}
+                        },
+                        {'$set': {'status': 'error', 'error_message': 'System restarted and missed schedule.'}}
+                    )
+                    
+                    total = result_active.modified_count + result_scheduled.modified_count
+                    if total > 0:
+                        logging.warning(f"   -> Cleaned {total} tasks in {project_code}.")
+            
+            except Exception as e:
+                logging.error(f"❌ Cleanup failed for {project_code}: {e}")
         # =========================================================
     
-
-    # 5. Register Blueprints
+    # 5. Register Blueprints (No changes needed here)
     from app.modules.auth.routes import auth_bp
     from app.modules.dashboard.routes import dashboard_bp
     from app.modules.tasks.routes import tasks_bp
@@ -86,7 +103,5 @@ def create_app():
     app.register_blueprint(config_bp)
     app.register_blueprint(call_audit_bp)
     app.register_blueprint(auth_bp, url_prefix='/api/auth')
-
- 
 
     return app
