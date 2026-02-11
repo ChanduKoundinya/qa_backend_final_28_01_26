@@ -10,7 +10,8 @@ from flask_jwt_extended import (
     unset_jwt_cookies
 )
 from datetime import datetime, timedelta
-
+from app.decorators import role_required
+from bson.objectid import ObjectId
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -45,7 +46,8 @@ def register():
             "email": data['email'],
             "password": hashed_password,
             "role": data['role'],
-            "project": project_code, # Storing the link here
+            "project": project_code,# Storing the link here
+            "is_active": True,
             "created_at": datetime.utcnow()
         }
         
@@ -70,6 +72,9 @@ def login():
 
         if not user:
             return jsonify({"error": "Invalid credentials"}), 401
+        
+        if not user.get('is_active', True):
+            return jsonify({"error": "Account is inactive. Please contact administrator."}), 403
 
         if not check_password_hash(user['password'], data.get('password')):
             return jsonify({"error": "Invalid credentials"}), 401
@@ -129,3 +134,111 @@ def logout():
     response = jsonify({"message": "Logout successful"})
     unset_jwt_cookies(response)
     return response, 200
+
+@auth_bp.route("/users", methods=['GET'])
+@jwt_required()
+@role_required(['superadmin', 'admin'])
+def get_users():
+    """
+    Fetch all users from the Central DB with their details.
+    """
+    try:
+        # Fetch users but exclude the password field (0 means exclude)
+        users_cursor = mongo.central_db.users.find({}, {'password': 0})
+        
+        users_list = []
+        for user in users_cursor:
+            users_list.append({
+                "id": str(user['_id']),
+                "username": user.get('username'),
+                "email": user.get('email'),
+                "role": user.get('role'),
+                "project": user.get('project'),
+                # Default to True if field is missing (for old users)
+                "is_active": user.get('is_active', True), 
+                "created_at": user.get('created_at')
+            })
+
+        return jsonify(users_list), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# 2. UPDATE USER (Role & Active Status)
+@auth_bp.route('/users/<user_id>', methods=['PUT'])
+@jwt_required()
+@role_required(['superadmin', 'admin'])
+def update_user(user_id):
+    """
+    Update a user's role or active status.
+    """
+    try:
+        data = request.get_json()
+        update_fields = {}
+
+        # Update Role
+        if 'role' in data:
+            # Optional: Add validation for valid roles
+            if data['role'] not in ['superadmin', 'admin', 'manager', 'user']:
+                return jsonify({"error": "Invalid role provided"}), 400
+            update_fields['role'] = data['role']
+
+        # Update Active Status
+        if 'is_active' in data:
+            update_fields['is_active'] = bool(data['is_active'])
+
+        if not update_fields:
+            return jsonify({"error": "No valid fields to update"}), 400
+
+        # Perform Update on Central DB
+        result = mongo.central_db.users.find_one_and_update(
+            {'_id': ObjectId(user_id)},
+            {'$set': update_fields},
+            return_document=True
+        )
+
+        if not result:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "message": "User updated successfully",
+            "user": {
+                "id": str(result['_id']),
+                "username": result['username'],
+                "role": result['role'],
+                "is_active": result.get('is_active', True)
+            }
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# 3. SOFT DELETE USER
+@auth_bp.route('/users/<user_id>', methods=['DELETE'])
+@jwt_required()
+@role_required(['superadmin']) # Maybe only superadmin can delete?
+def delete_user(user_id):
+    """
+    Soft delete a user by setting is_active = False.
+    """
+    try:
+        # We do NOT remove the document. We just update the status.
+        result = mongo.central_db.users.find_one_and_update(
+            {'_id': ObjectId(user_id)},
+            {'$set': {'is_active': False}},
+            return_document=True
+        )
+
+        if not result:
+            return jsonify({"error": "User not found"}), 404
+
+        return jsonify({
+            "message": "User deactivated successfully (Soft Delete)",
+            "user_id": str(result['_id']),
+            "is_active": result['is_active']
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
