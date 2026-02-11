@@ -202,7 +202,9 @@ def get_criteria():
         
         # 1. Build Query
         # Allow filtering by type (e.g. /api/criteria?type=call audit)
-        query = {}
+        query = {
+            'is_active': {'$ne': False} 
+        }
         requested_type = request.args.get('type')
         if requested_type:
             query['type'] = requested_type
@@ -217,7 +219,7 @@ def get_criteria():
                 'description': c.get('description', ''),
                 'type': c.get('type', 'ticket audit'), # ✅ Default to ticket audit for legacy data
                 'weight': c.get('weight', 1.0),
-                'is_active': c.get('is_active', False),
+                'is_active': c.get('is_active', True),
                 'last_modified_by_role': c.get('last_modified_by_role', 'System'),
                 'updated_at': c.get('updated_at').isoformat() if c.get('updated_at') else None,
                 'created_at': c.get('created_at').isoformat() if c.get('created_at') else None
