@@ -42,7 +42,7 @@ class CallReportEngine:
             row = {
                 "Call ID": doc.get("filename") or doc.get("task_id"),
                 "Agent Name": doc.get("agent_name", "Unknown"),       # <--- NEW
-                "Audit Date": doc.get("agent_audit_date", ""),
+                "Call Date": doc.get("agent_audit_date", ""),
                 "Overall Score": doc.get("score") or ai_data.get("Overall Score") or ai_data.get("score"),
                 "Processed At": doc.get("created_at")
             }
@@ -185,12 +185,16 @@ class CallReportEngine:
         df = pd.DataFrame(all_data)
 
         # 7. Column Sorting
-        fixed_cols = ["Call ID", "User Name", "User ID","Agent Name","Audit Date", "Ticket ID", "Overall Score", "Processed At", "Email", "Phone"]
+        fixed_cols = ["Call ID", "User Name", "User ID","Agent Name","Call Date", "Ticket ID", "Overall Score", "Processed At", "Email", "Phone"]
         existing_fixed = [c for c in fixed_cols if c in df.columns]
         dynamic_cols = [c for c in df.columns if c not in existing_fixed]
         dynamic_cols.sort()
 
         df = df[existing_fixed + dynamic_cols]
+
+        # 🟢 ADD THESE TWO LINES HERE:
+        df.fillna("N/A", inplace=True)       # Fixes None and NaN
+        df.replace("", "N/A", inplace=True)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
