@@ -141,7 +141,7 @@ def get_combined_dashboard_summary():
         # PATH B: CALL AUDIT
         # ==========================================
         elif category == 'call':
-            # 1. Helper Functions (Defined once at the start)
+            # 1. Helper Functions
             def format_for_ui(agg_list):
                 return [{
                     "id": "Agent", 
@@ -152,22 +152,32 @@ def get_combined_dashboard_summary():
             # 2. Total Count
             total_count = mongo.db.call_audit_results.count_documents(date_query)
 
-            # 3. Agent Aggregation (Unique Top/Least list based on averages)
+            # 3. Agent Aggregation (FIXED)
             agent_pipeline = [
                 {"$match": date_query},
                 {"$group": {
-                    "_id": "$full_data.User Info.user_name", 
+                    # 🟢 FIX: Group by the root-level 'agent_name' field
+                    "_id": "$agent_name", 
                     "avg_score": {"$avg": "$full_data.Overall Score"}
                 }},
                 {"$project": {
-                    "agent": "$_id", 
+                    # If agent_name is missing, default to "Unknown"
+                    "agent": {"$ifNull": ["$_id", "Unknown"]}, 
                     "score": {"$round": ["$avg_score", 2]}, 
                     "_id": 0
                 }}
             ]
-            top_agents = list(mongo.db.call_audit_results.aggregate(agent_pipeline + [{"$sort": {"score": -1}}, {"$limit": 5}]))
-            least_agents = list(mongo.db.call_audit_results.aggregate(agent_pipeline + [{"$sort": {"score": 1}}, {"$limit": 5}]))
-
+            
+            # Get Top 5
+            top_agents = list(mongo.db.call_audit_results.aggregate(
+                agent_pipeline + [{"$sort": {"score": -1}}, {"$limit": 5}]
+            ))
+            
+            # Get Least 5
+            least_agents = list(mongo.db.call_audit_results.aggregate(
+                agent_pipeline + [{"$sort": {"score": 1}}, {"$limit": 5}]
+            ))
+            
             # 4. Pie Chart
             pie_pipeline = [
                 {"$match": date_query},

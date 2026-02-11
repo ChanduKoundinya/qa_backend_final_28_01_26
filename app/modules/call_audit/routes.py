@@ -242,7 +242,7 @@ def save_call_results():
         agent_name, agent_date = parse_filename_metadata(filename)
 
         mongo.db.call_audit_results.insert_one({
-            "task_id": main_task_id, 
+             "task_id": main_task_id, 
             "filename": filename,
             "agent_name": agent_name,       # <--- Saved
             "agent_audit_date": agent_date, # <--- Saved
@@ -255,6 +255,7 @@ def save_call_results():
         updated_task = mongo.db.tasks.find_one_and_update(
             {'_id': ObjectId(main_task_id)},
             {
+                # Use the SAFE key here
                 '$set': {f'files_tracker.{safe_tracker_key}.status': 'complete'},
                 '$inc': {'completed_count': 1}
             },
