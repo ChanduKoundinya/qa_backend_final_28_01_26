@@ -4,12 +4,15 @@ from app.extensions import mongo, jwt  # Assuming you init JWTManager in extensi
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     create_access_token, 
+    create_refresh_token, # 🟢 NEW IMPORT
+    get_jti,               # 🟢 NEW IMPORT
     jwt_required, 
     get_jwt_identity, 
     get_jwt,
     unset_jwt_cookies
 )
 from datetime import datetime, timedelta
+from bson.objectid import ObjectId
 
 
 auth_bp = Blueprint('auth', __name__)
@@ -79,6 +82,12 @@ def login():
         
         if not user_project:
              return jsonify({"error": "User account corrupted: No project assigned"}), 500
+        
+        try:
+            jwt_config = mongo.central_db.api_config.find_one({"name": "jwt_settings"})
+            access_minutes = jwt_config.get('access_token_expires_minutes', 15) if jwt_config else 15
+        except:
+            access_minutes = 15
 
         # 3. Generate Token WITH PROJECT CLAIM
         # The rest of your app (Tasks, Audits) relies on this token claim.
@@ -89,13 +98,81 @@ def login():
                 "role": user['role'], 
                 "project": user_project, # <--- We pulled this from Central DB
                 "username": user['username']
-            }
+            },
+            expires_delta=timedelta(minutes=access_minutes) 
+        )
+
+        # 🟢 B. Refresh Token (Long - 7 Days)
+        refresh_token = create_refresh_token(
+            identity=str(user['_id']),
+            expires_delta=timedelta(days=7) 
+        )
+
+        # 🟢 4. Store Refresh Token in DB (Revocation Support)
+        refresh_jti = get_jti(refresh_token)
+        
+        mongo.central_db.refresh_tokens.insert_one({
+            "jti": refresh_jti,
+            "user_id": str(user['_id']),
+            "created_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + timedelta(days=7),
+            "device": request.headers.get('User-Agent', 'Unknown')
+        }
         )
 
         return jsonify({ 
             "message": "Login successful",
             "access_token": access_token,
-            "project": user_project # Optional: Let frontend know where they landed
+            "project": user_project,
+            "refresh_token": refresh_token,
+            "expires_in_minutes": access_minutes
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@auth_bp.route('/refresh', methods=['POST'])
+@jwt_required(refresh=True) # Validates signature & expiry of Refresh Token
+def refresh():
+    try:
+        current_user_id = get_jwt_identity()
+        current_jti = get_jwt()["jti"]
+
+        # 1. Revocation Check: Does this token exist in DB?
+        token_record = mongo.central_db.refresh_tokens.find_one({
+            "jti": current_jti, 
+            "user_id": current_user_id
+        })
+
+        if not token_record:
+            return jsonify({"error": "Refresh token revoked or invalid"}), 401
+
+        # 2. Fetch User (ensure role/project is current)
+        user = mongo.central_db.users.find_one({"_id": ObjectId(current_user_id)})
+        if not user:
+            return jsonify({"error": "User no longer exists"}), 401
+
+        # 3. Get Configured Expiry Time
+        try:
+            jwt_config = mongo.central_db.api_config.find_one({"name": "jwt_settings"})
+            access_minutes = jwt_config.get('access_token_expires_minutes', 15) if jwt_config else 15
+        except:
+            access_minutes = 15
+
+        # 4. Issue NEW Access Token
+        new_access_token = create_access_token(
+            identity=current_user_id,
+            additional_claims={
+                "role": user['role'], 
+                "project": user.get('project'), 
+                "username": user['username']
+            },
+            expires_delta=timedelta(minutes=access_minutes)
+        )
+
+        return jsonify({
+            "access_token": new_access_token,
+            "expires_in_minutes": access_minutes
         }), 200
 
     except Exception as e:
@@ -121,11 +198,20 @@ def profile():
 
 # --- 4. LOGOUT ENDPOINT ---
 @auth_bp.route("/logout", methods=["POST"])
-def logout():
+def logout(): 
     """
     Client-side: Delete the token from localStorage.
     Server-side (Optional): You can add the token to a Redis blacklist here if needed.
     """
-    response = jsonify({"message": "Logout successful"})
-    unset_jwt_cookies(response)
-    return response, 200
+    try:
+        jti = get_jwt()["jti"]
+        
+        # Revoke by deleting from DB
+        result = mongo.central_db.refresh_tokens.delete_one({"jti": jti})
+        
+        response = jsonify({"message": "Logout successful"})
+        unset_jwt_cookies(response)
+        return response, 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

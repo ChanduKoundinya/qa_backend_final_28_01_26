@@ -6,7 +6,7 @@ from app.extensions import mongo
 from . import config_bp
 import logging
 from app.decorators import role_required
-from flask_jwt_extended import jwt_required
+from flask_jwt_extended import jwt_required, get_jwt
 import uuid
 
 # --- API Configuration Routes (e.g. OpenAI Key) ---
