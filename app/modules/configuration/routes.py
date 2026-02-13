@@ -399,18 +399,46 @@ def update_criterion(crit_id):
         if 'type' in data:
             update_fields['type'] = new_type
 
-        # 4. Handle Name/Type Duplicate Check
-        # Only run check if Name OR Type is changing
+        # 4. Handle Name/Type Duplicate Check & AI Validation
         if 'name' in data or 'type' in data:
             if not new_name:
                  return api_response(message='Name cannot be empty', status=400)
             
+            # =========================================================
+            # 🟢 NEW: AI GUARDRAIL ON UPDATE (Only if name changed)
+            # =========================================================
+            if 'name' in data and new_name != current_doc['name']:
+                try:
+                    config_doc = mongo.db.api_config.find_one({"name": "openai_api_key"})
+                    api_key = config_doc.get('key') if config_doc else None
+                    base_url = current_app.config.get('CORE_SERVICE_URL')
+                    
+                    if api_key and base_url:
+                        core_url = base_url.rstrip('/') + "/internal/validate-criteria"
+                        response = requests.post(core_url, json={
+                            "term": new_name,
+                            "api_key": api_key
+                        }, timeout=3) 
+
+                        if response.status_code == 200:
+                            result = response.json()
+                            if not result.get('is_valid', True):
+                                return api_response(
+                                    message=f"Criteria Rejected by AI: {result.get('reason')}", 
+                                    status=400
+                                )
+                        else:
+                            logging.warning(f"⚠️ Core Validation failed: {response.status_code}")
+                except Exception as ai_error:
+                    logging.error(f"⚠️ Core Validation Unreachable: {ai_error}")
+            # =========================================================
+
             update_fields['name'] = new_name
 
             # Check if (New Name + New Type) is taken by another ID
             duplicate = mongo.db.criteria.find_one({
                 "name": {"$regex": f"^{new_name}$", "$options": "i"}, 
-                "type": new_type,  # ✅ Check against the specific type
+                "type": new_type,  
                 "_id": {"$ne": ObjectId(crit_id)},
                 "is_active": True
             })
