@@ -138,6 +138,7 @@ def get_all_configs():
 
 
 @config_bp.route('/api/configs/<config_id>', methods=['PUT'])
+@jwt_required()
 @role_required(['superadmin', 'admin'])
 def update_config(config_id):
     try:
@@ -356,6 +357,7 @@ def add_criterion():
 
 
 @config_bp.route('/api/criteria/<crit_id>', methods=['PUT'])
+@jwt_required()
 @role_required(['superadmin', 'admin'])
 def update_criterion(crit_id):
     """
@@ -423,10 +425,11 @@ def update_criterion(crit_id):
                         if response.status_code == 200:
                             result = response.json()
                             if not result.get('is_valid', True):
-                                return api_response(
-                                    message=f"Criteria Rejected by AI: {result.get('reason')}", 
-                                    status=400
-                                )
+                                return jsonify({
+                                    "status": "ai_rejected", # 🟢 Custom status flag for your frontend
+                                    "message": f"Criteria Rejected by AI: {result.get('reason')}",
+                                    "data": None
+                                }), 200
                         else:
                             logging.warning(f"⚠️ Core Validation failed: {response.status_code}")
                 except Exception as ai_error:
@@ -480,6 +483,7 @@ def update_criterion(crit_id):
         return api_response(message="Internal Server Error", status=500)
 
 @config_bp.route('/api/criteria/<crit_id>', methods=['DELETE'])
+@jwt_required()
 @role_required(['superadmin'])
 def delete_criterion(crit_id):
     """
