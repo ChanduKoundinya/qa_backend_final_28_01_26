@@ -1,18 +1,20 @@
 import logging
 #import gridfs
 from flask import Flask
-from datetime import datetime, timezone
+from datetime import datetime, timezone,timedelta
 from werkzeug.local import LocalProxy  # 🟢 1. ADD THIS IMPORT
 from pymongo import MongoClient        # 🟢 2. ADD THIS (for startup cleanup only)
 from .extensions import mongo, cors, scheduler, jwt, get_fs # 🟢 3. IMPORT get_fs
 from config import Config
 from flask_cors import CORS
-
+from flask_jwt_extended import JWTManager
 
 def create_app():
     # 1. Setup Logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
     app = Flask(__name__)
+    app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=1)
+    jwt = JWTManager(app)
     app.config.from_object(Config)
 
     web_url = app.config['WEB_URL']
