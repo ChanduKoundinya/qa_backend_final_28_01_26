@@ -1,7 +1,7 @@
 import os
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from bson.objectid import ObjectId
 from bson.errors import InvalidId
 import gridfs
@@ -27,6 +27,26 @@ def api_response(data=None, message="", status=200):
         "data": data
     }), status
     
+def get_utc_now():
+    """Returns current time in UTC, timezone-aware."""
+    return datetime.now(timezone.utc)
+
+def format_to_iso_z(dt):
+    """
+    Converts a datetime object to 'YYYY-MM-DDTHH:MM:SSZ' string.
+    Handles MongoDB naive datetimes by assuming they are UTC.
+    """
+    if not dt:
+        return None
+    
+    # If the datetime object has no timezone (MongoDB default), set it to UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+        
+    # isoformat() returns "+00:00" for UTC; we replace it with "Z"
+    return dt.isoformat().replace("+00:00", "Z")
+
+
 # --- BACKGROUND JOB (The Trigger) ---
 # --- BACKGROUND JOB (The Trigger) ---
 def run_scheduled_job(task_id, app_instance, project_code, features=None):
@@ -83,7 +103,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                         '$set': {
                             'status': 'complete',
                             'output_excel_id': excel_id,
-                            'completed_at': datetime.now()
+                            'completed_at': get_utc_now()
                         }
                     })
 
@@ -283,7 +303,7 @@ def upload_file():
                 "status": "scheduled" if is_scheduled else "queued",
                 "analysis_type": analysis_type,   
                 "audit_category": audit_category, 
-                "created_at": datetime.now(),
+                "created_at": get_utc_now(),
                 "scheduled_for": run_date,
                 "created_by": username
             }
@@ -445,8 +465,10 @@ def api_get_tasks():
                 'audit_category': category,
                 'analysis_type': task.get('analysis_type'),
                 'uploaded_by': task.get('created_by', 'System/Unknown'), # Fallback for old tasks
-                'uploaded_at': formatted_time,                           # Renamed for clarity, or keep 'created_at'
-                'created_at': task.get('created_at').strftime('%Y-%m-%d') if task.get('created_at') else None,
+                'uploaded_at': format_to_iso_z(task.get('created_at')), 
+                'created_at': format_to_iso_z(task.get('created_at')),
+                'scheduled_for': format_to_iso_z(task.get('scheduled_for')),
+                'completed_at': format_to_iso_z(task.get('completed_at')),
                 'output_excel_id': str(task.get('output_excel_id')) if task.get('output_excel_id') else None,
                 'output_docx_id': str(task.get('output_docx_id')) if task.get('output_docx_id') else None
             })
@@ -668,7 +690,7 @@ def save_audit_results():
                 'audit_category': current_category,
                 'output_excel_id': excel_id,
                 'output_docx_id': docx_id, 
-                'completed_at': datetime.now()
+                'completed_at': get_utc_now()
             }
         })
 

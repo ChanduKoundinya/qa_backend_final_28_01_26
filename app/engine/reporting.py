@@ -9,7 +9,7 @@ matplotlib.use('Agg') # Prevent GUI errors on server
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 
 # --- Helper Function to Add DataFrames to Word ---
 def add_df_to_doc(doc, df_input, title=""):
@@ -71,7 +71,8 @@ def generate_docx_report(df, output_path):
     
     doc = docx.Document()
     doc.add_heading('Comprehensive Ticket Audit Analysis Report', level=0)
-    doc.add_paragraph(f"Report generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    utc_now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
+    doc.add_paragraph(f"Report generated on: {utc_now}")
     doc.add_paragraph(f"Target Score for Agent Performance: {TARGET_SCORE}%")
     doc.add_page_break()
 

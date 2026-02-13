@@ -1,6 +1,6 @@
 import pytz
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 from bson.objectid import ObjectId
 from flask import request, jsonify
 from app.extensions import mongo
@@ -10,6 +10,17 @@ import logging
 from app.decorators import role_required
 from flask_jwt_extended import jwt_required, get_jwt
 import uuid
+
+
+# 🟢 Add Helpers
+def get_utc_now():
+    return datetime.now(timezone.utc)
+
+def format_to_iso_z(dt):
+    if not dt: return None
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
 
 # --- API Configuration Routes (e.g. OpenAI Key) ---
 def api_response(data=None, message="", status=200):
@@ -47,7 +58,7 @@ def add_new_tool(config_id):
             "instance_url": data.get('instance_url'),
             "credentials": data.get('credentials', {}),
             "sync_scheduler": data.get('sync_scheduler', {}),
-            "created_at": datetime.now() # Track creation time
+            "created_at": get_utc_now() # Track creation time
         }
 
         # 4. Push to MongoDB
@@ -96,7 +107,7 @@ def get_all_configs():
             config_entry = {
                 '_id': str(c['_id']),
                 'category': c.get('category'),
-                'updated_at': c.get('updated_at')
+                'updated_at': format_to_iso_z(c.get('updated_at'))
             }
 
             # 3. Process Tools & Mask Credentials
@@ -178,7 +189,7 @@ def update_config(config_id):
             {'_id': ObjectId(config_id)},
             {'$set': {
                 'tools': db_tools_list,  # We save the combined list
-                'updated_at': datetime.now()
+                'updated_at': get_utc_now()
             }}
         )
 
@@ -221,8 +232,8 @@ def get_criteria():
                 'weight': c.get('weight', 1.0),
                 'is_active': c.get('is_active', True),
                 'last_modified_by_role': c.get('last_modified_by_role', 'System'),
-                'updated_at': c.get('updated_at').isoformat() if c.get('updated_at') else None,
-                'created_at': c.get('created_at').isoformat() if c.get('created_at') else None
+                'updated_at': format_to_iso_z(c.get('updated_at')),
+                'created_at': format_to_iso_z(c.get('created_at'))
             })
         
         return api_response(
@@ -246,7 +257,8 @@ def add_criterion():
         name = data.get('name', '').strip()
         weight = float(data.get('weight', 1.0))
         criterion_type = data.get('type', '').strip().lower() 
-        user_role = data.get('role', 'System')
+        claims = get_jwt()
+        user_role = claims.get('role', 'System')
         description = data.get('description', '').strip() 
 
         # 1. Validation (Basic)
@@ -313,7 +325,7 @@ def add_criterion():
             )
 
         # 3. Create Object
-        now = datetime.now(pytz.utc)
+        now = get_utc_now()
         new_crit = {
             "name": name, 
             "description": description,
@@ -351,6 +363,9 @@ def update_criterion(crit_id):
     """
     try:
         data = request.get_json()
+
+        claims = get_jwt()
+        current_role = claims.get('role', 'System')
         
         # 1. Fetch current document first to handle partial updates correctly
         current_doc = mongo.db.criteria.find_one({'_id': ObjectId(crit_id)})
@@ -358,7 +373,8 @@ def update_criterion(crit_id):
              return api_response(message='Criterion not found', status=404)
 
         update_fields = {
-            "updated_at": datetime.now(pytz.utc)
+            "updated_at": get_utc_now(),
+            "last_modified_by_role": current_role
         }
 
         if 'description' in data:
@@ -446,7 +462,8 @@ def delete_criterion(crit_id):
         # 1. Try to get role from body (if sent) or query params
         # Note: DELETE requests with bodies are valid but sometimes discouraged.
         # We support both here for flexibility.
-        user_role = 'System'
+        claims = get_jwt()
+        current_role = claims.get('role', 'System')
         if request.is_json:
             user_role = request.get_json().get('role', 'System')
         else:
@@ -455,8 +472,8 @@ def delete_criterion(crit_id):
         # 2. Prepare Update Logic (Soft Delete)
         update_fields = {
             'is_active': False, 
-            'updated_at': datetime.now(pytz.utc),
-            'last_modified_by_role': user_role # ✅ Track who deleted it
+            'updated_at': get_utc_now(),
+            'last_modified_by_role': current_role # ✅ Track who deleted it
         }
 
         # 3. ATOMIC Soft Delete

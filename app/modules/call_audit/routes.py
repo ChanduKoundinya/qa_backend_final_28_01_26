@@ -5,7 +5,7 @@ import requests
 import threading
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from bson.objectid import ObjectId
 from flask import request, jsonify, current_app, g
 from . import call_audit_bp
@@ -16,6 +16,11 @@ from flask_jwt_extended import jwt_required, get_jwt
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
+
+def get_utc_now():
+    """Returns current time in UTC, timezone-aware."""
+    return datetime.now(timezone.utc)
+
 def parse_filename_metadata(filename):
     """
     Extracts Agent Name and Date from format:
@@ -182,7 +187,7 @@ def upload_call_audit():
             'total_files': len(files),
             'completed_count': 0,
             'audit_category': 'call audit',
-            'created_at': datetime.now(),
+            'created_at': get_utc_now(),
             'created_by': username,
             'output_excel_id': None
         }).inserted_id
@@ -247,7 +252,7 @@ def save_call_results():
             "agent_name": agent_name,       # <--- Saved
             "agent_audit_date": agent_date, # <--- Saved
             "full_data": result_item,
-            "created_at": datetime.now()
+            "created_at": get_utc_now()
         })
 
         safe_tracker_key = filename.replace('.', '_')
@@ -285,7 +290,7 @@ def save_call_results():
                     {'$set': {
                         'status': 'complete', 
                         'output_excel_id': excel_id,
-                        'completed_at': datetime.now()
+                        'completed_at': get_utc_now()
                     }}
                 )
 

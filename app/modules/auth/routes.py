@@ -9,11 +9,20 @@ from flask_jwt_extended import (
     get_jwt,
     unset_jwt_cookies
 )
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from app.decorators import role_required
 from bson.objectid import ObjectId
 
 auth_bp = Blueprint('auth', __name__)
+
+# 🟢 Add Helpers
+def get_utc_now():
+    return datetime.now(timezone.utc)
+
+def format_to_iso_z(dt):
+    if not dt: return None
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
 
 @auth_bp.route('/register', methods=['POST'])
 def register():
@@ -48,7 +57,7 @@ def register():
             "role": data['role'],
             "project": project_code,# Storing the link here
             "is_active": True,
-            "created_at": datetime.utcnow()
+            "created_at": get_utc_now()
         }
         
         mongo.central_db.users.insert_one(new_user)
@@ -156,7 +165,7 @@ def get_users():
                 "project": user.get('project'),
                 # Default to True if field is missing (for old users)
                 "is_active": user.get('is_active', True), 
-                "created_at": user.get('created_at')
+                "created_at": format_to_iso_z(user.get('created_at'))
             })
 
         return jsonify(users_list), 200

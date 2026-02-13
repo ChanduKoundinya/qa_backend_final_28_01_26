@@ -1,7 +1,7 @@
 import logging
 #import gridfs
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, timezone
 from werkzeug.local import LocalProxy  # 🟢 1. ADD THIS IMPORT
 from pymongo import MongoClient        # 🟢 2. ADD THIS (for startup cleanup only)
 from .extensions import mongo, cors, scheduler, jwt, get_fs # 🟢 3. IMPORT get_fs
@@ -78,7 +78,7 @@ def create_app():
                     result_scheduled = db.tasks.update_many(
                         {
                             'status': 'scheduled',
-                            'scheduled_for': {'$lt': datetime.now()}
+                            'scheduled_for': {'$lt': datetime.now(timezone.utc)}
                         },
                         {'$set': {'status': 'error', 'error_message': 'System restarted and missed schedule.'}}
                     )
