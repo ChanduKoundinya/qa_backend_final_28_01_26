@@ -286,15 +286,18 @@ def add_criterion():
             
             if api_key and base_url:
                 core_url = base_url.rstrip('/') + "/internal/validate-criteria"
+            
+    
                 
                 # Send HTTP Request
                 response = requests.post(core_url, json={
                     "term": name,
                     "api_key": api_key
-                }, timeout=3) 
+                }, timeout=10) 
 
                 if response.status_code == 200:
                     result = response.json()
+                    
                     # If AI says INVALID, block the request
                     if not result.get('is_valid', True):
                         return api_response(
@@ -382,10 +385,6 @@ def update_criterion(crit_id):
         if 'description' in data:
             update_fields['description'] = data['description'].strip()
 
-        # 2. Update Role
-        if 'role' in data:
-            update_fields['last_modified_by_role'] = data['role']
-
         # 3. Determine proposed Name and Type for Duplicate Check
         # If user sends new data, use it; otherwise use existing data from DB
         new_name = data.get('name', current_doc['name']).strip()
@@ -414,24 +413,27 @@ def update_criterion(crit_id):
                     config_doc = mongo.db.api_config.find_one({"name": "openai_api_key"})
                     api_key = config_doc.get('key') if config_doc else None
                     base_url = current_app.config.get('CORE_SERVICE_URL')
+                    audit_type = request.json.get('type', 'ticket audit')
                     
                     if api_key and base_url:
                         core_url = base_url.rstrip('/') + "/internal/validate-criteria"
                         response = requests.post(core_url, json={
                             "term": new_name,
+                            "audit_type": audit_type,
                             "api_key": api_key
-                        }, timeout=3) 
+                        }, timeout=10) 
 
                         if response.status_code == 200:
                             result = response.json()
                             if not result.get('is_valid', True):
+                                logging.warning(f"⚠️ AI REJECTED Update for '{new_name}': {result.get('reason')}")
                                 return jsonify({
-                                    "status": "ai_rejected", # 🟢 Custom status flag for your frontend
+                                    "status": "ai_rejected", 
                                     "message": f"Criteria Rejected by AI: {result.get('reason')}",
                                     "data": None
                                 }), 200
-                        else:
-                            logging.warning(f"⚠️ Core Validation failed: {response.status_code}")
+                            else:
+                                logging.info(f"✅ AI ACCEPTED Update for term: '{new_name}'")
                 except Exception as ai_error:
                     logging.error(f"⚠️ Core Validation Unreachable: {ai_error}")
             # =========================================================
@@ -471,6 +473,8 @@ def update_criterion(crit_id):
         
         updated_doc['id'] = str(updated_doc['_id'])
         del updated_doc['_id']
+
+        logging.info(f"💾 SUCCESS: Criteria ID {crit_id} updated to '{new_name}' in Database.")
 
         return api_response(
             data=updated_doc,

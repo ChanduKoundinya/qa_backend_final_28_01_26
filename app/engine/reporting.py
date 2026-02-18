@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
 from datetime import datetime, timezone
+import pytz
 
 # --- Helper Function to Add DataFrames to Word ---
 def add_df_to_doc(doc, df_input, title=""):
@@ -60,7 +61,7 @@ def add_df_to_doc(doc, df_input, title=""):
     doc.add_paragraph() # Add spacing after table
 
 # --- Main Report Generation Function ---
-def generate_docx_report(df, output_path):
+def generate_docx_report(df, output_path,user_tz='UTC'):
     """
     Generates a comprehensive Word report with charts, adhering to the logic
     from the original incident.py file.
@@ -71,8 +72,20 @@ def generate_docx_report(df, output_path):
     
     doc = docx.Document()
     doc.add_heading('Comprehensive Ticket Audit Analysis Report', level=0)
-    utc_now = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
-    doc.add_paragraph(f"Report generated on: {utc_now}")
+    try:
+        # Get exact UTC time right now
+        utc_now = datetime.now(timezone.utc)
+        # Convert it to the user's specific timezone
+        local_tz = pytz.timezone(user_tz)
+        local_now = utc_now.astimezone(local_tz)
+        # Format it nicely (e.g., "2026-02-17 10:30:45 AM IST")
+        formatted_time = local_now.strftime('%Y-%m-%d %I:%M:%S %p %Z')
+    except Exception:
+        # Fail-safe just in case the timezone string is invalid
+        formatted_time = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%SZ')
+
+    # Add the localized time to the top of the Word doc!
+    doc.add_paragraph(f"Report generated on: {formatted_time}")
     doc.add_paragraph(f"Target Score for Agent Performance: {TARGET_SCORE}%")
     doc.add_page_break()
 

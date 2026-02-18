@@ -27,7 +27,7 @@ class CallReportEngine:
                 if found: return found
         return None
 
-    def generate_excel(self, db_records):
+    def generate_excel(self, db_records, user_tz='UTC'):
         """
         Converts a list of MongoDB documents into an Excel file in memory.
         """
@@ -195,6 +195,32 @@ class CallReportEngine:
         # 🟢 ADD THESE TWO LINES HERE:
         df.fillna("N/A", inplace=True)       # Fixes None and NaN
         df.replace("", "N/A", inplace=True)
+
+        date_keywords = ['date', 'time', 'processed at', 'created_at']
+        potential_time_cols = [
+            col for col in df.columns 
+            if any(kw in col.lower() for kw in date_keywords) 
+            and "(Score)" not in col # 🟢 Explicitly skip score columns
+        ]
+        
+        for col in potential_time_cols:
+            try:
+                # Convert string to standard Pandas datetime, coercing errors
+                temp_col = pd.to_datetime(df[col], errors='coerce')
+                
+                # Check if the column actually contains valid dates
+                if not temp_col.isna().all():
+                    # 1. Anchor to UTC if it doesn't have a timezone yet
+                    if temp_col.dt.tz is None:
+                        temp_col = temp_col.dt.tz_localize('UTC')
+                        
+                    # 2. Shift to User's Timezone
+                    temp_col = temp_col.dt.tz_convert(user_tz)
+                    
+                    # 3. Strip timezone for Excel
+                    df[col] = temp_col.dt.tz_localize(None)
+            except Exception:
+                pass
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:

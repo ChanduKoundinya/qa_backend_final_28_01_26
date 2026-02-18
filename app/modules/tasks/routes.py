@@ -83,6 +83,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                 
                 try:
                     grid_out = current_app.fs.get(ObjectId(task['input_file_id']))
+                    user_tz = task.get('user_tz', 'UTC')
                     grid_out.seek(0)
                     if task['filename'].endswith('.csv'):
                         df = pd.read_csv(grid_out)
@@ -90,7 +91,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                         df = pd.read_excel(grid_out)
                     
                     feat_list = eval(features) if isinstance(features, str) else (features or [])
-                    output_bytes = generate_incident_report(df, feat_list)
+                    output_bytes = generate_incident_report(df, feat_list, user_tz)
 
                     filename = f"Report_{task_id}.xlsx"
                     excel_id = current_app.fs.put(
@@ -110,7 +111,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                     mongo.db.INCIDENT_RESULTS.insert_one({
                         "task_id": task_id,
                         "report_file_id": excel_id,
-                        "generated_at": datetime.now(),
+                        "generated_at": get_utc_now(),
                         "file_name": filename
                     })
 
@@ -266,6 +267,7 @@ def upload_file():
         claims = get_jwt()
         current_project = claims.get('project')
         username = claims.get("username", "Unknown User") 
+        user_tz = request.form.get('timezone', 'UTC')
         
         if not current_project:
             return api_response(message="Project context missing in token", status=400)
@@ -274,15 +276,19 @@ def upload_file():
         # ---------------------------------------------------------
         # 🕒 IMPROVED SCHEDULING LOGIC (From your "Below" Code)
         # ---------------------------------------------------------
-        run_date = datetime.now()
+        run_date = get_utc_now() # ✅ Default to immediate UTC execution
         is_scheduled = False
 
         if schedule_time_str:
             try:
-                target_date = datetime.strptime(schedule_time_str, "%Y-%m-%dT%H:%M")
+                # 1. Parse the string into a naive datetime
+                naive_target_date = datetime.strptime(schedule_time_str, "%Y-%m-%dT%H:%M")
                 
-                # ✅ ADDED: Validation to prevent past dates
-                if target_date < datetime.now():
+                # 2. Assign the UTC timezone to make it aware
+                target_date = naive_target_date.replace(tzinfo=timezone.utc)
+                
+                # 3. Compare aware datetime with aware datetime
+                if target_date < get_utc_now(): 
                     return api_response(message="Scheduled time cannot be in the past.", status=400)
                 
                 run_date = target_date
@@ -305,7 +311,8 @@ def upload_file():
                 "audit_category": audit_category, 
                 "created_at": get_utc_now(),
                 "scheduled_for": run_date,
-                "created_by": username
+                "created_by": username,
+                "user_tz": user_tz
             }
             
             task_result = mongo.db.tasks.insert_one(task)
@@ -349,7 +356,7 @@ def upload_file():
                 "task_id": task_id,
                 "filename": filename,
                 "status": "scheduled" if is_scheduled else "queued",
-                "scheduled_at": run_date.isoformat(),
+                "scheduled_at": format_to_iso_z(run_date),
                 "analysis_type": analysis_type,
                 "audit_category": audit_category
             }
@@ -636,11 +643,27 @@ def save_audit_results():
         if audit_data:
             # 🟢 RISK MITIGATION: Missing Data Columns
             # We create the DataFrame safely
+            task = mongo.db.tasks.find_one({'_id': ObjectId(task_id)})
+            user_tz = task.get('user_tz', 'UTC') if task else 'UTC'
             df_results = pd.DataFrame(audit_data)
             
             # Safe drop (your existing check was good, kept it)
             if 'Issues Count' in df_results.columns:
                 df_results = df_results.drop(columns=['Issues Count'])
+
+            date_keywords = ['time', 'date', ' at']
+            potential_time_cols = [col for col in df_results.columns if any(kw in col.lower() for kw in date_keywords)]
+            
+            for col in potential_time_cols:
+                try:
+                    temp_col = pd.to_datetime(df_results[col], errors='coerce')
+                    if not temp_col.isna().all():
+                        if temp_col.dt.tz is None:
+                            temp_col = temp_col.dt.tz_localize('UTC')
+                        temp_col = temp_col.dt.tz_convert(user_tz)
+                        df_results[col] = temp_col.dt.strftime('%Y-%m-%d') # Strip tag for Excel/Word
+                except Exception:
+                    pass # Skip if it wasn't actually a date column
 
             logging.info(f"📊 Columns: {df_results.columns.tolist()}")
 
@@ -675,7 +698,7 @@ def save_audit_results():
                     with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
                         temp_path = tmp.name
                     
-                    generate_docx_report(df_results, temp_path)
+                    generate_docx_report(df_results, temp_path, user_tz)
                     
                     with open(temp_path, 'rb') as f:
                         docx_id = current_app.fs.put(f, filename=f"report_{task_id}.docx")
@@ -719,6 +742,7 @@ def upload_incident_report():
         # 🟢 GET CURRENT PROJECT
         claims = get_jwt()
         current_project = claims.get('project')
+        user_tz = request.form.get('timezone', 'UTC')
 
         # 2. Encryption Check
         file_pos = file.tell()
@@ -777,8 +801,9 @@ def upload_incident_report():
             "input_file_id": input_file_id,
             "status": "queued",
             "analysis_type": "incident_report",
-            "created_at": datetime.now()
-        }
+            "created_at": get_utc_now(),
+            "user_tz": user_tz       
+            }
         res = mongo.db.tasks.insert_one(task)
         task_id = str(res.inserted_id)
 
@@ -790,7 +815,7 @@ def upload_incident_report():
                 id=task_id,
                 func=run_scheduled_job,
                 trigger='date',
-                run_date=datetime.now(),
+                run_date=get_utc_now(),
                 # 🟢 PASS 'current_project' HERE TOO
                 args=[task_id, real_app, current_project], 
                 kwargs={'features': feats},

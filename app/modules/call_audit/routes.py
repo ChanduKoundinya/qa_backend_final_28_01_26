@@ -120,6 +120,7 @@ def upload_call_audit():
         claims = get_jwt()
         project_code = claims.get('project')
         username = claims.get("username", "Unknown User")
+        user_tz = request.form.get('timezone', 'UTC')
 
         if not project_code:
              return jsonify({"error": "Project context missing in token"}), 400
@@ -146,6 +147,7 @@ def upload_call_audit():
             {"is_active": True, "type": "call audit"}, 
             {'_id': 0, 'name': 1, 'weight': 1, 'description': 1}
         ))
+        print(f"DEBUG: Found {len(criteria_list)} criteria for upload") # 🟢 Add this
         
         if not criteria_list:
             # Fallback defaults if DB is empty
@@ -189,7 +191,8 @@ def upload_call_audit():
             'audit_category': 'call audit',
             'created_at': get_utc_now(),
             'created_by': username,
-            'output_excel_id': None
+            'output_excel_id': None,
+            'user_tz': user_tz
         }).inserted_id
 
         logging.info(f"🆔 Created Master Task: {main_task_id}")
@@ -273,9 +276,41 @@ def save_call_results():
 
         if done >= total:
             logging.info(f"🏁 Batch {main_task_id} Complete. Generating Report...")
-            all_results = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
+            user_tz = updated_task.get('user_tz', 'UTC')
+            
+            # 1. Fetch the raw results
+            raw_db_records = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
+            
+            # 2. PRE-PROCESS (Flatten) the records before sending to the engine
+            processed_for_engine = []
+            for doc in raw_db_records:
+                # Create a clean copy of the document
+                flat_doc = {
+                    "filename": doc.get("filename"),
+                    "agent_name": doc.get("agent_name"),
+                    "agent_audit_date": doc.get("agent_audit_date"),
+                    "created_at": doc.get("created_at"),
+                    "full_data": doc.get("full_data", {})  # Keep this so the engine can find "Breakdown"
+                }
+                
+                # 🟢 THE KEY STEP: 
+                # Extract the items from 'Breakdown' and put them at the top level 
+                # so the engine's column sorter sees them.
+                ai_data = doc.get("full_data", {})
+                breakdown = ai_data.get("Breakdown", [])
+                
+                if isinstance(breakdown, list):
+                    for item in breakdown:
+                        param = item.get("Parameter")
+                        if param:
+                            # Move data to top level so the Engine finds it
+                            flat_doc[param] = item 
+                
+                processed_for_engine.append(flat_doc)
+
+            # 3. Now pass the PROCESSED list to your engine
             engine = CallReportEngine()
-            excel_output = engine.generate_excel(all_results)
+            excel_output = engine.generate_excel(processed_for_engine, user_tz)
             
             if excel_output:
                 filename_report = f"Master_Report_{main_task_id}.xlsx"

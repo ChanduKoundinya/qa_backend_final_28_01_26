@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 import io 
 import warnings
 
@@ -7,12 +7,12 @@ import warnings
 warnings.simplefilter(action='ignore', category=UserWarning)
 warnings.simplefilter(action='ignore', category=FutureWarning)
 
-def generate_incident_report(df: pd.DataFrame, active_features: list):
+def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: str = 'UTC'):
     """
     Core Logic: Takes a DataFrame, runs math, and returns an Excel file in memory.
     Refactored from your standalone Incident Reporting Tool.
     """
-    current_date = datetime.now()
+    current_date = datetime.now(timezone.utc).replace(tzinfo=None)
     
     # --- 1. Data Cleaning & Safety Checks (Preserved from Original) ---
     if 'Closed Time' not in df.columns:
@@ -22,6 +22,12 @@ def generate_incident_report(df: pd.DataFrame, active_features: list):
     for col in time_cols:
         if col in df.columns:
             df[col] = pd.to_datetime(df[col], errors='coerce')
+
+            if not df[col].isna().all():
+                if df[col].dt.tz is None:
+                    df[col] = df[col].dt.tz_localize('UTC') # Anchor to UTC
+                df[col] = df[col].dt.tz_convert(user_tz)    # Shift to user's time
+                df[col] = df[col].dt.tz_localize(None)
 
     # Convert Numeric Columns (Time in Hrs)
     for col in ['First Response Time (in Hrs)', 'Resolution Time (in Hrs)']:

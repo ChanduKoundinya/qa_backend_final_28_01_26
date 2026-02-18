@@ -56,6 +56,20 @@ def get_combined_dashboard_summary():
         stats_output = {}
         tickets_output = {}
 
+
+        criteria_type = 'ticket audit' if category == 'qa' else 'call audit'
+        
+        # Fetch only active criteria names from DB
+        active_criteria_cursor = mongo.db.criteria.find(
+            {"type": criteria_type, "is_active": True},
+            {"name": 1, "_id": 0}
+        )
+        active_criteria_names = [doc["name"] for doc in active_criteria_cursor]
+        
+        # If there are no active criteria, ensure we don't crash (pass an empty list)
+        if not active_criteria_names:
+            active_criteria_names = []
+
         # ==========================================
         # PATH A: QA / GENERAL AUDIT
         # ==========================================
@@ -96,8 +110,7 @@ def get_combined_dashboard_summary():
                 {"$unwind": "$data_array"},
                 {"$match": {
                     "data_array.k": {
-                        "$nin": ["_id", "Agent", "Ticket ID", "Overall Score", "Audit Date", 
-                                 "Evaluation Remarks", "Agent Score", "user_id", "ticket_id"]
+                        "$in": active_criteria_names
                     }
                 }},
                 {"$group": {
@@ -196,6 +209,11 @@ def get_combined_dashboard_summary():
             bar_pipeline = [
                 {"$match": date_query}, 
                 {"$unwind": "$full_data.Breakdown"}, 
+                {"$match": {
+                    "full_data.Breakdown.Parameter": {
+                        "$in": active_criteria_names
+                    }
+                }},
                 {"$group": {
                     "_id": {
                         "parameter": "$full_data.Breakdown.Parameter",
