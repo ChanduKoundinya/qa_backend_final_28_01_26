@@ -753,7 +753,14 @@ def upload_incident_report():
             return api_response(message='Cannot read encrypted file.', status=400)
 
         # 3. "Header Hunting" Validation
-        REQUIRED_COLUMNS = {'Priority', 'Created Time'}
+        REQUIRED_COLUMNS = {
+    'Priority', 
+    'Created Time', 
+    'Category', 
+    'Requester Name', 
+    'Type', 
+    'Resolution Time (in Hrs)'
+}
         is_valid = False
         
         try:
@@ -769,7 +776,7 @@ def upload_incident_report():
                 is_valid = True
             else:
                 # Scan next 10 rows
-                for i in range(1, 11):
+                for i in range(1, 20):
                     file.seek(0)
                     if file.filename.endswith('.csv'):
                         df = pd.read_csv(file, header=i)
@@ -793,7 +800,7 @@ def upload_incident_report():
         # 5. Get Active Features (Safe Query)
         # Note: We do NOT use ObjectId here, just a standard find.
         feats = [f.get('sheet_name_prefix') for f in mongo.db.incident_features.find({"is_active": True}) if f.get('sheet_name_prefix')]
-        if not feats: feats = [str(i) for i in range(1, 11)] # Default 1-10
+        if not feats: feats = [str(i) for i in range(1, 18)] # Default 1-10
 
         # 6. Create Task & Trigger Core
         task = {
