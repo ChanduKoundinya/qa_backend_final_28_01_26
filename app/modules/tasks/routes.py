@@ -752,55 +752,91 @@ def upload_incident_report():
         if file.filename.endswith('.xlsx') and header == OLE_MAGIC:
             return api_response(message='Cannot read encrypted file.', status=400)
 
-        # 3. "Header Hunting" Validation
-        REQUIRED_COLUMNS = {
-    'Priority', 
-    'Created Time', 
-    'Category', 
-    'Requester Name', 
-    'Type', 
-    'Resolution Time (in Hrs)'
-}
-        is_valid = False
-        
+        # 3. Read & Parse File to DataFrame
         try:
             if file.filename.endswith('.csv'):
                 df = pd.read_csv(file)
             else:
                 df = pd.read_excel(file)
             
+            # Normalize headers (strip spaces)
             df.columns = df.columns.astype(str).str.strip()
+            current_headers = list(df.columns)
             
-            # Check row 0
-            if REQUIRED_COLUMNS.issubset(set(df.columns)):
-                is_valid = True
-            else:
-                # Scan next 10 rows
-                for i in range(1, 20):
-                    file.seek(0)
-                    if file.filename.endswith('.csv'):
-                        df = pd.read_csv(file, header=i)
-                    else:
-                        df = pd.read_excel(file, header=i)
+            # 🟢 3.1 UPDATED: Define EXACTLY the 13 columns your Pandas script needs
+            INCIDENT_REQUIRED = [
+                'Ticket Id', 'Created Time', 'Closed Time', 'Resolved Time', 
+                'Priority', 'Status', 'Type', 'Group', 'Agent', 
+                'Category', 'Requester Name', 'Item', 'Resolution Time (in Hrs)','Description'
+            ]
+            
+            # 3.2 Check for Missing Columns
+            missing = [req for req in INCIDENT_REQUIRED if req not in current_headers]
+            
+            if missing:
+                logging.info(f"⚠️ Incident Upload missing {len(missing)} columns. Asking Core AI to map...")
+                
+                # 🟢 1. FETCH API KEY FROM DB
+                config_doc = mongo.db.api_config.find_one({"name": "openai_api_key"})
+                api_key = config_doc.get("key") if config_doc else None
+                
+                if not api_key:
+                    logging.error("❌ API Key missing in DB. Cannot perform AI mapping.")
+                    return api_response(message="System configuration error (Missing API Key)", status=500)
+
+                # Call Core Service
+                core_url = current_app.config['CORE_SERVICE_URL'].rstrip('/') + "/internal/ai-map-custom"
+                
+                # 🟢 2. SEND KEY IN PAYLOAD
+                payload = {
+                    "headers": current_headers,
+                    "target_fields": INCIDENT_REQUIRED, # Passed for fallback, though core now hardcodes it
+                    "api_key": api_key  
+                }
+                
+                try:
+                    response = requests.post(core_url, json=payload, timeout=30)
                     
-                    df.columns = df.columns.astype(str).str.strip()
-                    if REQUIRED_COLUMNS.issubset(set(df.columns)):
-                        is_valid = True
-                        break
+                    if response.status_code == 200:
+                        mapping = response.json().get('mapping', {})
+                        
+                        # 🟢 ADDED: Print the mapping to the backend terminal for easy debugging
+                        print("\n" + "="*50)
+                        print("🔍 AI COLUMN MAPPING RESULTS (BACKEND)")
+                        print("="*50)
+                        for target, found in mapping.items():
+                            status = f"✅ [{found}]" if found else "❌ (null)"
+                            print(f"{target:25} : {status}")
+                        print("="*50 + "\n")
+
+                        # AI returns {Target: Found}, Pandas needs {Found: Target}
+                        # We flip the dictionary, ignoring nulls
+                        rename_dict = {v: k for k, v in mapping.items() if v}
+                        
+                        df.rename(columns=rename_dict, inplace=True)
+                        logging.info(f"✅ AI Mapping Applied. Cleaned columns ready for DB.")
+                    else:
+                        logging.error(f"❌ Core AI Mapping failed: {response.text}")
+                except Exception as e:
+                    logging.error(f"❌ Connection to Core failed: {e}")
+
         except Exception as e:
-            return api_response(message=f"File validation failed: {str(e)}", status=400)
+            return api_response(message=f"File parsing failed: {str(e)}", status=400)
 
-        if not is_valid:
-            return api_response(message=f"Invalid columns. Required: {REQUIRED_COLUMNS}", status=400)
-
-        # 4. Save to GridFS
-        file.seek(0) # Reset pointer before saving
-        input_file_id = current_app.fs.put(file, filename=file.filename)
-
-        # 5. Get Active Features (Safe Query)
-        # Note: We do NOT use ObjectId here, just a standard find.
+        # 4. Save Modified Data to GridFS
+        output_buffer = io.BytesIO()
+        if file.filename.endswith('.csv'):
+            df.to_csv(output_buffer, index=False)
+        else:
+            with pd.ExcelWriter(output_buffer, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False)
+        
+        output_buffer.seek(0)
+        input_file_id = current_app.fs.put(output_buffer, filename=file.filename)
+        
+        # 5. Get Active Features
         feats = [f.get('sheet_name_prefix') for f in mongo.db.incident_features.find({"is_active": True}) if f.get('sheet_name_prefix')]
-        if not feats: feats = [str(i) for i in range(1, 18)] # Default 1-10
+        if not feats: feats = [str(i) for i in range(1, 18)]
 
         # 6. Create Task & Trigger Core
         task = {
@@ -814,7 +850,7 @@ def upload_incident_report():
         res = mongo.db.tasks.insert_one(task)
         task_id = str(res.inserted_id)
 
-        # 7. Schedule Job (Robust Config)
+        # 7. Schedule Job
         try:
             real_app = current_app._get_current_object()
             
@@ -823,7 +859,6 @@ def upload_incident_report():
                 func=run_scheduled_job,
                 trigger='date',
                 run_date=get_utc_now(),
-                # 🟢 PASS 'current_project' HERE TOO
                 args=[task_id, real_app, current_project], 
                 kwargs={'features': feats},
                 replace_existing=True,
@@ -843,6 +878,7 @@ def upload_incident_report():
     except Exception as e:
         logging.error(f"Incident Upload Error: {e}")
         return api_response(message=f"Internal Server Error: {str(e)}", status=500)
+    
 
 # 🟢 NEW ENDPOINT: Receive PII Logs from Core Service
 @tasks_bp.route('/internal/save-pii-logs', methods=['POST'])
