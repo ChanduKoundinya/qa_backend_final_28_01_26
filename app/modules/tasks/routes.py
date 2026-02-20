@@ -48,7 +48,6 @@ def format_to_iso_z(dt):
 
 
 # --- BACKGROUND JOB (The Trigger) ---
-# --- BACKGROUND JOB (The Trigger) ---
 def run_scheduled_job(task_id, app_instance, project_code, features=None):
     """
     Hybrid Trigger: 
@@ -93,7 +92,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                     feat_list = eval(features) if isinstance(features, str) else (features or [])
                     output_bytes = generate_incident_report(df, feat_list, user_tz)
 
-                    filename = f"Report_{task_id}.xlsx"
+                    filename = f"Incident_Report_{task_id}.xlsx"
                     excel_id = current_app.fs.put(
                         output_bytes, 
                         filename=filename,
@@ -250,6 +249,16 @@ def upload_file():
         file.seek(0) # Reset cursor for reading/saving
         if file_size == 0:
             return api_response(message='File is empty.', status=400)
+        
+        try:
+            if filename.lower().endswith('.csv'):
+                df_temp = pd.read_csv(file)
+            else:
+                df_temp = pd.read_excel(file)
+            total_tickets_count = len(df_temp)
+            file.seek(0) # Reset cursor again so GridFS can save it properly!
+        except Exception as parse_e:
+            return api_response(message=f"File parsing failed: {str(parse_e)}", status=400)
 
         # 2. Validation: Parse Inputs
         schedule_time_str = request.form.get('schedule_time') 
@@ -312,7 +321,8 @@ def upload_file():
                 "created_at": get_utc_now(),
                 "scheduled_for": run_date,
                 "created_by": username,
-                "user_tz": user_tz
+                "user_tz": user_tz,
+                "total_tickets": total_tickets_count
             }
             
             task_result = mongo.db.tasks.insert_one(task)
@@ -623,7 +633,7 @@ def save_audit_results():
         if 'excel_file' in request.files:
             f = request.files['excel_file']
             if f.filename != '': 
-                unique_name = f"results_{task_id}.xlsx"
+                unique_name = f"ticket_audit_Report_{task_id}.xlsx"
                 excel_id = current_app.fs.put(f, filename=unique_name)
 
         # 3. Process Results (JSON) 
@@ -681,7 +691,7 @@ def save_audit_results():
                     df_results.to_excel(writer, index=False, sheet_name='Results')
                 output.seek(0)
                 
-                filename = f"results_{task_id}.xlsx"
+                filename = f"ticket_audit_Report_{task_id}.xlsx"
                 excel_id = current_app.fs.put(
                     output, 
                     filename=filename,
@@ -701,7 +711,7 @@ def save_audit_results():
                     generate_docx_report(df_results, temp_path, user_tz)
                     
                     with open(temp_path, 'rb') as f:
-                        docx_id = current_app.fs.put(f, filename=f"report_{task_id}.docx")
+                        docx_id = current_app.fs.put(f, filename=f"ticket_audit_Report_{task_id}.docx")
                     os.remove(temp_path)
                 except Exception as report_err:
                     logging.exception("❌ DOCX Failed") 
@@ -845,7 +855,8 @@ def upload_incident_report():
             "status": "queued",
             "analysis_type": "incident_report",
             "created_at": get_utc_now(),
-            "user_tz": user_tz       
+            "user_tz": user_tz ,
+            "total_tickets": len(df)  
             }
         res = mongo.db.tasks.insert_one(task)
         task_id = str(res.inserted_id)

@@ -8,7 +8,7 @@ from flask_jwt_extended import JWTManager, get_jwt, verify_jwt_in_request
 from pymongo import MongoClient
 import gridfs
 
-cors = CORS()
+cors = CORS(expose_headers=["Content-Disposition"])
 scheduler = APScheduler()
 jwt = JWTManager()
 

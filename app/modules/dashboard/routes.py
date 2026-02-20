@@ -79,11 +79,18 @@ def get_combined_dashboard_summary():
             total_count = mongo.db.audit_reports.count_documents(date_query)
 
             # A2. Agent Aggregation
+            # 1. Create a specific match query that excludes invalid agent names
+            agent_match_query = date_query.copy()
+            agent_match_query["Agent"] = {
+                "$nin": [None, "", "No Agent", "Unknown", "Unknown Agent", "Unassigned", "NaN"]
+            }
+
             agent_pipeline = [
-                {"$match": date_query},
+                {"$match": agent_match_query}, # 2. Use the new match query here
                 {"$group": {"_id": "$Agent", "average_score": {"$avg": "$Overall Score"}}},
                 {"$project": {"agent": "$_id", "score": {"$round": ["$average_score", 2]}, "_id": 0}}
             ]
+            
             top_agents = list(mongo.db.audit_reports.aggregate(agent_pipeline + [{"$sort": {"score": -1}}, {"$limit": 5}]))
             least_agents = list(mongo.db.audit_reports.aggregate(agent_pipeline + [{"$sort": {"score": 1}}, {"$limit": 5}]))
 
