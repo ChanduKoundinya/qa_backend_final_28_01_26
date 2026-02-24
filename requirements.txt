@@ -14,3 +14,4 @@ flask-jwt-extended
 flask_apscheduler
 xlsxwriter
 spacy
+faster-whisper
