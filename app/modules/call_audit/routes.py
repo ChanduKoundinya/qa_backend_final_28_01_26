@@ -12,6 +12,7 @@ from . import call_audit_bp
 from app.extensions import mongo
 from app.engine.call_report import CallReportEngine
 from flask_jwt_extended import jwt_required, get_jwt
+from faster_whisper import WhisperModel
 
 # ==========================================
 # 1. HELPER FUNCTIONS
@@ -47,20 +48,25 @@ def parse_filename_metadata(filename):
     return agent_name, audit_date
 
 # ==========================================
-# 🟢 2. BACKGROUND WORKER (The Fix)
+# 🟢 2. BACKGROUND WORKER (Batch/Parallel Fix)
 # ==========================================
 def background_worker(app, project_code, file_data_list, main_task_id, api_key, core_url, criteria_list):
     """
-    Runs in a background thread.
-    We MUST pass the 'app' object and 'project_code' explicitly.
+    Runs in a background thread. Sends multiple files to Core at the EXACT SAME TIME.
     """
     # 1. Manually activate the Flask App Context
     with app.app_context():
         # 2. Manually Set the Tenant Context
         g.current_tenant = project_code
         
-        logging.info(f"🧵 Worker started for Project: {project_code} | Task: {main_task_id}")
+        logging.info(f"🧵 Worker started for Project: {project_code} | Batch Task: {main_task_id}")
 
+        files_to_send = []
+        safe_keys = []
+
+        # ==========================================
+        # 🟢 STEP 1: THE LOOP (ONLY for bundling files, NOT sending)
+        # ==========================================
         for file_item in file_data_list:
             filename = file_item['filename']
             file_bytes = file_item['content'] # Binary data from memory
@@ -68,45 +74,56 @@ def background_worker(app, project_code, file_data_list, main_task_id, api_key, 
             
             # Sanitize filename for DB Key
             safe_key = filename.replace('.', '_')
-            
-            # 🟢 CONSTRUCT THE PASSPORT ID
-            # This ensures the Core Service sends back the correct ID for PII logs
-            composite_id = f"{project_code}___{main_task_id}___{filename}"
+            safe_keys.append(safe_key)
 
-            try:
-                # Prepare payload
-                files = {'audio_file': (filename, io.BytesIO(file_bytes), mimetype)}
-                data = {
-                    'task_id': composite_id,  # <--- Sending the Passport
-                    'api_key': api_key,
-                    'criteria': json.dumps(criteria_list),
-                    'scoring_text': "" 
-                }
+            # Append to the list instead of sending. Notice the key is 'audio_files' (plural)
+            files_to_send.append(('audio_files', (filename, io.BytesIO(file_bytes), mimetype)))
 
-                # Send to Core
-                logging.info(f"   📤 Sending {filename} to Core...")
-                response = requests.post(core_url, files=files, data=data, timeout=600)
+            # Update Tracker to Processing immediately for this file
+            mongo.db.tasks.update_one(
+                {'_id': main_task_id},
+                {'$set': {f'files_tracker.{safe_key}.status': 'processing'}}
+            )
+        # <--- THE LOOP ENDS HERE. Notice how the code below is un-indented!
 
-                if response.status_code == 200:
-                    logging.info(f"   ✅ Core accepted {filename}")
-                    # Update Tracker to Processing
+        # ==========================================
+        # 🟢 STEP 2: SEND THE BATCH (Outside the loop!)
+        # ==========================================
+        # Construct a Batch ID (No filename included since it's a batch of files)
+        batch_task_id = f"{project_code}___{main_task_id}"
+
+        try:
+            # Prepare payload for the whole batch
+            data = {
+                'task_id': batch_task_id, 
+                'api_key': api_key,
+                'criteria': json.dumps(criteria_list),
+                'scoring_text': "" 
+            }
+
+            # Send all files in ONE massive request
+            logging.info(f" 📤 Sending BATCH of {len(files_to_send)} files to Core simultaneously...")
+            response = requests.post(core_url, files=files_to_send, data=data, timeout=600)
+
+            if response.status_code == 200:
+                logging.info(" ✅ Core successfully accepted the batch!")
+                # Note: Core will send the webhook back to update these to 'completed' later
+            else:
+                logging.error(f" ⚠️ Core Rejected Batch: {response.text}")
+                # If batch fails, loop through safe_keys to fail them all in DB
+                for sk in safe_keys:
                     mongo.db.tasks.update_one(
                         {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'processing'}}
-                    )
-                else:
-                    logging.error(f"   ⚠️ Core Rejected {filename}: {response.text}")
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
+                        {'$set': {f'files_tracker.{sk}.status': 'error'}}
                     )
 
-            except Exception as e:
-                logging.error(f"   ❌ Thread Error on {filename}: {e}")
-                # Update Tracker to Error
+        except Exception as e:
+            logging.error(f" ❌ Thread Error on Batch sending: {e}")
+            # Same here, fail all files in DB if the network crashes
+            for sk in safe_keys:
                 mongo.db.tasks.update_one(
                     {'_id': main_task_id},
-                    {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
+                    {'$set': {f'files_tracker.{sk}.status': 'error'}}
                 )
 
 # ==========================================
@@ -236,98 +253,114 @@ def save_call_results():
         if not composite_id or "___" not in composite_id:
             return jsonify({"error": "Invalid Task ID format"}), 400
 
-        # Split and Set Context
-        project_code, main_task_id, filename = composite_id.split("___", 2)
+        # 🟢 FIX 1: Safely unpack the Batch ID (handles both 2-part and 3-part IDs)
+        parts = composite_id.split("___")
+        project_code = parts[0]
+        main_task_id = parts[1]
         
         # 🟢 Activate DB (Crucial for Multi-tenancy)
         g.current_tenant = project_code
 
+        # Parse the JSON array sent by the Core Server
         audit_data = json.loads(audit_results_str)
-        result_item = audit_data[0] if isinstance(audit_data, list) else audit_data
-        result_item['filename'] = filename 
+        
+        # Ensure it's a list so we can loop through it
+        if not isinstance(audit_data, list):
+            audit_data = [audit_data]
 
-        # 🟢 METADATA EXTRACTION (Restored)
-        agent_name, agent_date = parse_filename_metadata(filename)
+        updated_task = None
 
-        mongo.db.call_audit_results.insert_one({
-             "task_id": main_task_id, 
-            "filename": filename,
-            "agent_name": agent_name,       # <--- Saved
-            "agent_audit_date": agent_date, # <--- Saved
-            "full_data": result_item,
-            "created_at": get_utc_now()
-        })
-
-        safe_tracker_key = filename.replace('.', '_')
-
-        updated_task = mongo.db.tasks.find_one_and_update(
-            {'_id': ObjectId(main_task_id)},
-            {
-                # Use the SAFE key here
-                '$set': {f'files_tracker.{safe_tracker_key}.status': 'complete'},
-                '$inc': {'completed_count': 1}
-            },
-            return_document=True
-        )
-
-        # Check completion logic (Generate Excel if done)
-        total = updated_task.get('total_files', 0)
-        done = updated_task.get('completed_count', 0)
-
-        if done >= total:
-            logging.info(f"🏁 Batch {main_task_id} Complete. Generating Report...")
-            user_tz = updated_task.get('user_tz', 'UTC')
+        # 🟢 FIX 2: Loop through ALL files in the batch
+        for result_item in audit_data:
+            # The Core server now injects 'Filename' into the JSON!
+            filename = result_item.get('Filename') 
             
-            # 1. Fetch the raw results
-            raw_db_records = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
-            
-            # 2. PRE-PROCESS (Flatten) the records before sending to the engine
-            processed_for_engine = []
-            for doc in raw_db_records:
-                # Create a clean copy of the document
-                flat_doc = {
-                    "filename": doc.get("filename"),
-                    "agent_name": doc.get("agent_name"),
-                    "agent_audit_date": doc.get("agent_audit_date"),
-                    "created_at": doc.get("created_at"),
-                    "full_data": doc.get("full_data", {})  # Keep this so the engine can find "Breakdown"
-                }
-                
-                # 🟢 THE KEY STEP: 
-                # Extract the items from 'Breakdown' and put them at the top level 
-                # so the engine's column sorter sees them.
-                ai_data = doc.get("full_data", {})
-                breakdown = ai_data.get("Breakdown", [])
-                
-                if isinstance(breakdown, list):
-                    for item in breakdown:
-                        param = item.get("Parameter")
-                        if param:
-                            # Move data to top level so the Engine finds it
-                            flat_doc[param] = item 
-                
-                processed_for_engine.append(flat_doc)
+            if not filename:
+                logging.warning(f"⚠️ Skipping a result because filename is missing.")
+                continue
 
-            # 3. Now pass the PROCESSED list to your engine
-            engine = CallReportEngine()
-            excel_output = engine.generate_excel(processed_for_engine, user_tz)
-            
-            if excel_output:
-                filename_report = f"Master_Report_{main_task_id}.xlsx"
-                excel_id = current_app.fs.put(
-                    excel_output, 
-                    filename=filename_report,
-                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
+            result_item['filename'] = filename 
+
+            # 🟢 METADATA EXTRACTION
+            agent_name, agent_date = parse_filename_metadata(filename)
+
+            # Save to Database
+            mongo.db.call_audit_results.insert_one({
+                "task_id": main_task_id, 
+                "filename": filename,
+                "agent_name": agent_name,       
+                "agent_audit_date": agent_date, 
+                "full_data": result_item,
+                "created_at": get_utc_now()
+            })
+
+            safe_tracker_key = filename.replace('.', '_')
+
+            # Update the progress tracker for THIS specific file
+            updated_task = mongo.db.tasks.find_one_and_update(
+                {'_id': ObjectId(main_task_id)},
+                {
+                    '$set': {f'files_tracker.{safe_tracker_key}.status': 'complete'},
+                    '$inc': {'completed_count': 1}
+                },
+                return_document=True
+            )
+
+        # 🟢 FIX 3: Check completion logic AFTER the loop finishes
+        if updated_task:
+            total = updated_task.get('total_files', 0)
+            done = updated_task.get('completed_count', 0)
+
+            # Make sure we only generate the Excel sheet once!
+            if done >= total and updated_task.get('status') != 'complete':
+                logging.info(f"🏁 Batch {main_task_id} Complete. Generating Report...")
+                user_tz = updated_task.get('user_tz', 'UTC')
                 
-                mongo.db.tasks.update_one(
-                    {'_id': ObjectId(main_task_id)},
-                    {'$set': {
-                        'status': 'complete', 
-                        'output_excel_id': excel_id,
-                        'completed_at': get_utc_now()
-                    }}
-                )
+                # 1. Fetch the raw results
+                raw_db_records = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
+                
+                # 2. PRE-PROCESS (Flatten) the records before sending to the engine
+                processed_for_engine = []
+                for doc in raw_db_records:
+                    flat_doc = {
+                        "filename": doc.get("filename"),
+                        "agent_name": doc.get("agent_name"),
+                        "agent_audit_date": doc.get("agent_audit_date"),
+                        "created_at": doc.get("created_at"),
+                        "full_data": doc.get("full_data", {})  
+                    }
+                    
+                    ai_data = doc.get("full_data", {})
+                    breakdown = ai_data.get("Breakdown", [])
+                    
+                    if isinstance(breakdown, list):
+                        for item in breakdown:
+                            param = item.get("Parameter")
+                            if param:
+                                flat_doc[param] = item 
+                    
+                    processed_for_engine.append(flat_doc)
+
+                # 3. Now pass the PROCESSED list to your engine
+                engine = CallReportEngine()
+                excel_output = engine.generate_excel(processed_for_engine, user_tz)
+                
+                if excel_output:
+                    filename_report = f"Master_Report_{main_task_id}.xlsx"
+                    excel_id = current_app.fs.put(
+                        excel_output, 
+                        filename=filename_report,
+                        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                    )
+                    
+                    mongo.db.tasks.update_one(
+                        {'_id': ObjectId(main_task_id)},
+                        {'$set': {
+                            'status': 'complete', 
+                            'output_excel_id': excel_id,
+                            'completed_at': get_utc_now()
+                        }}
+                    )
 
         return jsonify({"status": "success"}), 200
 
