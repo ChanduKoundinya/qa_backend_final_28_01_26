@@ -4,19 +4,22 @@ import re
 import requests
 import threading
 import io
-import os
+import concurrent.futures
 from datetime import datetime, timezone
-from bson.objectid import ObjectId
+
 from flask import request, jsonify, current_app, g
-from . import call_audit_bp
-from app.extensions import mongo
-from app.engine.call_report import CallReportEngine
 from flask_jwt_extended import jwt_required, get_jwt
+from sqlalchemy.orm.attributes import flag_modified
+
+from . import call_audit_bp
+from app.engine.call_report import CallReportEngine
+
+# 🟢 POSTGRESQL MODELS IMPORT
+from app.models import db, Task, Criterion, ApiConfig, CallAuditResult, StoredFile
 
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
-
 def get_utc_now():
     """Returns current time in UTC, timezone-aware."""
     return datetime.now(timezone.utc)
@@ -29,15 +32,13 @@ def parse_filename_metadata(filename):
     agent_name = "Unknown"
     audit_date = None
 
-    # 1. Extract Name: Content inside [ ] at the start
     name_match = re.search(r"^\[([^\]]+)\]", filename)
     if name_match:
         agent_name = name_match.group(1)
 
-    # 2. Extract Date: Look for YYYYMMDD pattern
     date_match = re.search(r"(\d{8})\d{6}", filename)
     if date_match:
-        raw_date = date_match.group(1) # e.g., "20251229"
+        raw_date = date_match.group(1) 
         try:
             dt_obj = datetime.strptime(raw_date, "%Y%m%d")
             audit_date = dt_obj.strftime("%Y-%m-%d")
@@ -47,67 +48,69 @@ def parse_filename_metadata(filename):
     return agent_name, audit_date
 
 # ==========================================
-# 🟢 2. BACKGROUND WORKER (The Fix)
+# 2. BACKGROUND WORKER (Parallel Version)
 # ==========================================
 def background_worker(app, project_code, file_data_list, main_task_id, api_key, core_url, criteria_list):
     """
-    Runs in a background thread.
-    We MUST pass the 'app' object and 'project_code' explicitly.
+    Runs in a background thread and dispatches files to the Core Service concurrently.
     """
-    # 1. Manually activate the Flask App Context
     with app.app_context():
-        # 2. Manually Set the Tenant Context
-        g.current_tenant = project_code
-        
-        logging.info(f"🧵 Worker started for Project: {project_code} | Task: {main_task_id}")
+        logging.info(f"🧵 Parallel Worker started for Project: {project_code} | Task: {main_task_id}")
 
-        for file_item in file_data_list:
+    def process_single_file(file_item):
+        with app.app_context():
             filename = file_item['filename']
-            file_bytes = file_item['content'] # Binary data from memory
+            file_bytes = file_item['content'] 
             mimetype = file_item['mimetype']
             
-            # Sanitize filename for DB Key
             safe_key = filename.replace('.', '_')
-            
-            # 🟢 CONSTRUCT THE PASSPORT ID
-            # This ensures the Core Service sends back the correct ID for PII logs
             composite_id = f"{project_code}___{main_task_id}___{filename}"
 
             try:
-                # Prepare payload
                 files = {'audio_file': (filename, io.BytesIO(file_bytes), mimetype)}
                 data = {
-                    'task_id': composite_id,  # <--- Sending the Passport
+                    'task_id': composite_id,  
                     'api_key': api_key,
                     'criteria': json.dumps(criteria_list),
                     'scoring_text': "" 
                 }
 
-                # Send to Core
                 logging.info(f"   📤 Sending {filename} to Core...")
                 response = requests.post(core_url, files=files, data=data, timeout=600)
 
+                # 🟢 PostgreSQL JSONB Update
+                # We fetch the task, update the dictionary, and flag it as modified
+                task = Task.query.get(main_task_id)
+                if not task:
+                    return
+
                 if response.status_code == 200:
                     logging.info(f"   ✅ Core accepted {filename}")
-                    # Update Tracker to Processing
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'processing'}}
-                    )
+                    task.files_tracker[safe_key]['status'] = 'processing'
                 else:
                     logging.error(f"   ⚠️ Core Rejected {filename}: {response.text}")
-                    mongo.db.tasks.update_one(
-                        {'_id': main_task_id},
-                        {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
-                    )
+                    task.files_tracker[safe_key]['status'] = 'error'
+
+                # Tell SQLAlchemy the JSONB column changed
+                flag_modified(task, 'files_tracker')
+                db.session.commit()
 
             except Exception as e:
                 logging.error(f"   ❌ Thread Error on {filename}: {e}")
-                # Update Tracker to Error
-                mongo.db.tasks.update_one(
-                    {'_id': main_task_id},
-                    {'$set': {f'files_tracker.{safe_key}.status': 'error'}}
-                )
+                task = Task.query.get(main_task_id)
+                if task:
+                    task.files_tracker[safe_key]['status'] = 'error'
+                    flag_modified(task, 'files_tracker')
+                    db.session.commit()
+
+    # Execute in parallel safely
+    max_threads = min(10, len(file_data_list)) 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+        executor.map(process_single_file, file_data_list)
+
+    with app.app_context():
+        logging.info(f"🏁 All parallel upload threads finished dispatching.")
+
 
 # ==========================================
 # 3. UPLOAD ROUTE
@@ -125,9 +128,6 @@ def upload_call_audit():
         if not project_code:
              return jsonify({"error": "Project context missing in token"}), 400
 
-        # Lock Context for Main Thread
-        g.current_tenant = project_code 
-
         # 2. Capture Files
         files = []
         if 'audio_files' in request.files:
@@ -142,35 +142,29 @@ def upload_call_audit():
 
         logging.info(f"📥 [Bulk Upload] Received {len(files)} audio files.")
 
-        # 3. Prepare Common Data
-        criteria_list = list(mongo.db.criteria.find(
-            {"is_active": True, "type": "call audit"}, 
-            {'_id': 0, 'name': 1, 'weight': 1, 'description': 1}
-        ))
-        print(f"DEBUG: Found {len(criteria_list)} criteria for upload") # 🟢 Add this
+        # 3. Prepare Common Data (SQLAlchemy Fetch)
+        criteria_records = Criterion.query.filter_by(is_active=True, type="call audit", project_code=project_code).all()
+        criteria_list = [{'name': c.name, 'weight': c.weight, 'description': c.description} for c in criteria_records]
         
         if not criteria_list:
-            # Fallback defaults if DB is empty
             criteria_list = [{"name": "Opening", "weight": 1}, {"name": "Closing", "weight": 1}]
 
-        config_doc = mongo.db.api_config.find_one({"name": "openai_api_key"})
-        api_key = config_doc.get("key") if config_doc else None
+        config_doc = ApiConfig.query.filter_by(name="openai_api_key", project_code=project_code).first()
+        api_key = config_doc.key if config_doc else None
         
         if not api_key:
             return jsonify({"error": "OpenAI Key not configured"}), 500
 
         core_url = current_app.config.get('CORE_SERVICE_URL', "http://127.0.0.1:6000") + "/internal/process-call"
 
-        # 4. Create Master Task
+        # 4. Create Master Task Data
         files_tracker = {}
-        # We need to read files into memory to pass to thread (Flask file objects can't pass)
         file_data_list = []
 
         for f in files:
             safe_key = f.filename.replace('.', '_')
             files_tracker[safe_key] = {"status": "queued", "error": None}
             
-            # Read content to memory (Fixes thread context issues)
             f.stream.seek(0)
             content = f.read()
             file_data_list.append({
@@ -181,37 +175,30 @@ def upload_call_audit():
 
         batch_name = f"{files[0].filename} + {len(files)-1} others" if len(files) > 1 else files[0].filename
 
-        main_task_id = mongo.db.tasks.insert_one({
-            'type': 'call_audit_batch',
-            'status': 'processing',
-            'filename': batch_name, 
-            'files_tracker': files_tracker, 
-            'total_files': len(files),
-            'completed_count': 0,
-            'audit_category': 'call audit',
-            'created_at': get_utc_now(),
-            'created_by': username,
-            'output_excel_id': None,
-            'user_tz': user_tz
-        }).inserted_id
+        # 🟢 CREATE POSTGRES TASK
+        new_task = Task(
+            filename=batch_name,
+            status='processing',
+            files_tracker=files_tracker,
+            total_files=len(files),
+            completed_count=0,
+            audit_category='call audit',
+            created_by=username,
+            user_tz=user_tz,
+            project_code=project_code
+        )
+        db.session.add(new_task)
+        db.session.commit()
+        
+        main_task_id = new_task.id # Integer ID in Postgres!
 
-        logging.info(f"🆔 Created Master Task: {main_task_id}")
+        logging.info(f"🆔 Created Postgres Master Task: {main_task_id}")
 
         # 5. Start Background Thread
-        # We pass 'current_app._get_current_object()' so the thread can access config
         app_obj = current_app._get_current_object()
-        
         thread = threading.Thread(
             target=background_worker,
-            args=(
-                app_obj, 
-                project_code, 
-                file_data_list, 
-                main_task_id, 
-                api_key, 
-                core_url, 
-                criteria_list
-            )
+            args=(app_obj, project_code, file_data_list, main_task_id, api_key, core_url, criteria_list)
         )
         thread.start()
 
@@ -223,6 +210,7 @@ def upload_call_audit():
     except Exception as e:
         logging.error(f"❌ Critical Upload Error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 # ==========================================
 # 4. SAVE RESULTS ROUTE
@@ -236,101 +224,102 @@ def save_call_results():
         if not composite_id or "___" not in composite_id:
             return jsonify({"error": "Invalid Task ID format"}), 400
 
-        # Split and Set Context
-        project_code, main_task_id, filename = composite_id.split("___", 2)
-        
-        # 🟢 Activate DB (Crucial for Multi-tenancy)
-        g.current_tenant = project_code
+        project_code, main_task_id_str, filename = composite_id.split("___", 2)
+        main_task_id = int(main_task_id_str) # Postgres uses Int
 
         audit_data = json.loads(audit_results_str)
         result_item = audit_data[0] if isinstance(audit_data, list) else audit_data
         result_item['filename'] = filename 
 
-        # 🟢 METADATA EXTRACTION (Restored)
         agent_name, agent_date = parse_filename_metadata(filename)
 
-        mongo.db.call_audit_results.insert_one({
-             "task_id": main_task_id, 
-            "filename": filename,
-            "agent_name": agent_name,       # <--- Saved
-            "agent_audit_date": agent_date, # <--- Saved
-            "full_data": result_item,
-            "created_at": get_utc_now()
-        })
+        # 🟢 SAVE TO POSTGRES CALL RESULTS TABLE
+        new_result = CallAuditResult(
+            task_id=main_task_id,
+            filename=filename,
+            agent_name=agent_name,
+            agent_audit_date=agent_date,
+            full_data=result_item,
+            project_code=project_code
+        )
+        db.session.add(new_result)
 
         safe_tracker_key = filename.replace('.', '_')
 
-        updated_task = mongo.db.tasks.find_one_and_update(
-            {'_id': ObjectId(main_task_id)},
-            {
-                # Use the SAFE key here
-                '$set': {f'files_tracker.{safe_tracker_key}.status': 'complete'},
-                '$inc': {'completed_count': 1}
-            },
-            return_document=True
-        )
+        # 🟢 LOCK ROW FOR CONCURRENT UPDATE
+        # with_for_update() prevents thread race conditions on completed_count
+        task = Task.query.with_for_update().get(main_task_id)
+        
+        if task:
+            task.files_tracker[safe_tracker_key]['status'] = 'complete'
+            task.completed_count += 1
+            flag_modified(task, 'files_tracker')
+            db.session.commit()
+        else:
+            db.session.rollback()
+            return jsonify({"error": "Task not found"}), 404
 
-        # Check completion logic (Generate Excel if done)
-        total = updated_task.get('total_files', 0)
-        done = updated_task.get('completed_count', 0)
+        total = task.total_files or 0
+        done = task.completed_count or 0
 
+        # Check completion
         if done >= total:
             logging.info(f"🏁 Batch {main_task_id} Complete. Generating Report...")
-            user_tz = updated_task.get('user_tz', 'UTC')
+            user_tz = task.user_tz or 'UTC'
             
-            # 1. Fetch the raw results
-            raw_db_records = list(mongo.db.call_audit_results.find({'task_id': main_task_id}))
+            # Fetch the raw results from Postgres
+            raw_db_records = CallAuditResult.query.filter_by(task_id=main_task_id).all()
             
-            # 2. PRE-PROCESS (Flatten) the records before sending to the engine
             processed_for_engine = []
             for doc in raw_db_records:
-                # Create a clean copy of the document
                 flat_doc = {
-                    "filename": doc.get("filename"),
-                    "agent_name": doc.get("agent_name"),
-                    "agent_audit_date": doc.get("agent_audit_date"),
-                    "created_at": doc.get("created_at"),
-                    "full_data": doc.get("full_data", {})  # Keep this so the engine can find "Breakdown"
+                    "filename": doc.filename,
+                    "agent_name": doc.agent_name,
+                    "agent_audit_date": doc.agent_audit_date,
+                    "created_at": doc.created_at,
+                    "full_data": doc.full_data
                 }
                 
-                # 🟢 THE KEY STEP: 
-                # Extract the items from 'Breakdown' and put them at the top level 
-                # so the engine's column sorter sees them.
-                ai_data = doc.get("full_data", {})
+                ai_data = doc.full_data or {}
                 breakdown = ai_data.get("Breakdown", [])
                 
                 if isinstance(breakdown, list):
                     for item in breakdown:
                         param = item.get("Parameter")
                         if param:
-                            # Move data to top level so the Engine finds it
-                            flat_doc[param] = item 
+                            # The Casing Fix from earlier
+                            normalized_param = param.strip().title()
+                            flat_doc[normalized_param] = item 
                 
                 processed_for_engine.append(flat_doc)
 
-            # 3. Now pass the PROCESSED list to your engine
             engine = CallReportEngine()
             excel_output = engine.generate_excel(processed_for_engine, user_tz)
             
             if excel_output:
                 filename_report = f"call_audit_Report_{main_task_id}.xlsx"
-                excel_id = current_app.fs.put(
-                    excel_output, 
-                    filename=filename_report,
-                    content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                )
                 
-                mongo.db.tasks.update_one(
-                    {'_id': ObjectId(main_task_id)},
-                    {'$set': {
-                        'status': 'complete', 
-                        'output_excel_id': excel_id,
-                        'completed_at': get_utc_now()
-                    }}
+                # 🟢 GRIDFS REPLACEMENT: Save Excel to StoredFile (BYTEA)
+                # We read the output buffer into raw bytes
+                excel_output.seek(0)
+                new_file = StoredFile(
+                    filename=filename_report,
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    file_data=excel_output.read(),
+                    project_code=project_code
                 )
+                db.session.add(new_file)
+                db.session.flush() # Get ID without committing transaction
+                
+                # Update task with File ID
+                task.status = 'complete'
+                task.output_excel_id = new_file.id
+                task.completed_at = get_utc_now()
+                db.session.commit()
 
         return jsonify({"status": "success"}), 200
 
     except Exception as e:
+        db.session.rollback()
         logging.error(f"Error saving results: {e}")
         return jsonify({"error": str(e)}), 500

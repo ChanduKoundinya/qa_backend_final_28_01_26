@@ -1,146 +1,134 @@
-from flask import jsonify, request
-from datetime import datetime
-from app.extensions import mongo
-from . import dashboard_bp
-import certifi
-from flask_pymongo import PyMongo
-
 from flask import Blueprint, request, jsonify
-from datetime import datetime
-import pymongo
-from flask_jwt_extended import jwt_required
+from datetime import datetime, timezone
+from flask_jwt_extended import jwt_required, get_jwt
+
+# 🟢 POSTGRESQL MODELS IMPORT
+from app.models import db, AuditReport, CallAuditResult, Criterion
+
 dashboard_bp = Blueprint('dashboard', __name__)
 
 @dashboard_bp.route('/api/combined-dashboard-summary')
 @jwt_required()
 def get_combined_dashboard_summary():
     """
-    Unified Dashboard Summary
+    Unified Dashboard Summary (PostgreSQL Version)
     Params:
       - category: 'qa' (default) OR 'call'
       - start_date: 'YYYY-MM-DD'
       - end_date: 'YYYY-MM-DD'
     """
     try:
-        # 1. Get Parameters and normalize to LOWERCASE
-        # This turns "QA" -> "qa"
-        category = request.args.get('category', 'qa').lower() 
+        # 1. Get User Context
+        claims = get_jwt()
+        project_code = claims.get('project')
         
+        category = request.args.get('category', 'qa').lower() 
         start_date_str = request.args.get('start_date')
         end_date_str = request.args.get('end_date')
-
-        # 2. Build Date Filter based on Category
-        date_query = {}
-
-        if start_date_str and end_date_str:
-            # 🟢 FIX: Check for 'qa' (lowercase)
-            if category == 'qa':
-                # QA DB uses "Audit Date" as STRING
-                date_query = {
-                    "Audit Date": {
-                        "$gte": start_date_str,
-                        "$lte": end_date_str
-                    }
-                }
-            elif category == 'call':
-                # Call DB uses "created_at" as DATETIME
-                s_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-                e_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59)
-                date_query = {
-                    "created_at": {
-                        "$gte": s_date,
-                        "$lte": e_date
-                    }
-                }
 
         stats_output = {}
         tickets_output = {}
 
-
         criteria_type = 'ticket audit' if category == 'qa' else 'call audit'
         
-        # Fetch only active criteria names from DB
-        active_criteria_cursor = mongo.db.criteria.find(
-            {"type": criteria_type, "is_active": True},
-            {"name": 1, "_id": 0}
-        )
-        active_criteria_names = [doc["name"] for doc in active_criteria_cursor]
+        # 2. Fetch Active Criteria for this tenant
+        active_criteria_records = Criterion.query.filter_by(
+            type=criteria_type, 
+            is_active=True, 
+            project_code=project_code
+        ).all()
         
-        # If there are no active criteria, ensure we don't crash (pass an empty list)
+        active_criteria_names = [c.name for c in active_criteria_records]
         if not active_criteria_names:
             active_criteria_names = []
 
         # ==========================================
-        # PATH A: QA / GENERAL AUDIT
+        # PATH A: QA / GENERAL AUDIT (Ticket)
         # ==========================================
-        # 🟢 FIX: Check for 'qa' (lowercase)
         if category == 'qa':
-            # A1. Total Count
-            total_count = mongo.db.audit_reports.count_documents(date_query)
-
-            # A2. Agent Aggregation
-            # 1. Create a specific match query that excludes invalid agent names
-            agent_match_query = date_query.copy()
-            agent_match_query["Agent"] = {
-                "$nin": [None, "", "No Agent", "Unknown", "Unknown Agent", "Unassigned", "NaN"]
-            }
-
-            agent_pipeline = [
-                {"$match": agent_match_query}, # 2. Use the new match query here
-                {"$group": {"_id": "$Agent", "average_score": {"$avg": "$Overall Score"}}},
-                {"$project": {"agent": "$_id", "score": {"$round": ["$average_score", 2]}, "_id": 0}}
-            ]
+            # 1. Build Query
+            query = AuditReport.query.filter_by(project_code=project_code)
             
-            top_agents = list(mongo.db.audit_reports.aggregate(agent_pipeline + [{"$sort": {"score": -1}}, {"$limit": 5}]))
-            least_agents = list(mongo.db.audit_reports.aggregate(agent_pipeline + [{"$sort": {"score": 1}}, {"$limit": 5}]))
+            # QA uses "Audit Date" inside the JSONB full_data
+            if start_date_str and end_date_str:
+                query = query.filter(
+                    AuditReport.full_data['Audit Date'].astext >= start_date_str,
+                    AuditReport.full_data['Audit Date'].astext <= end_date_str
+                )
+                
+            records = query.all()
+            
+            # 2. Aggregation Variables
+            total_count = len(records)
+            agent_scores = {}
+            pie_counts = {0: 0, 60: 0, 80: 0, 90: 0}
+            bar_counts = {name: {} for name in active_criteria_names}
+            valid_tickets = []
+            
+            invalid_agents = {None, "", "No Agent", "Unknown", "Unknown Agent", "Unassigned", "NaN"}
 
-            # A3. Pie Chart
-            pie_pipeline = [
-                {"$match": date_query},
-                {
-                    "$bucket": {
-                        "groupBy": "$Overall Score",
-                        "boundaries": [0, 60, 80, 90, 101],
-                        "default": "Other",
-                        "output": { "count": { "$sum": 1 } }
-                    }
-                }
-            ]
-            raw_pie = list(mongo.db.audit_reports.aggregate(pie_pipeline))
+            # 3. Process Records
+            for r in records:
+                data = r.full_data or {}
+                agent = data.get('Agent')
+                raw_score = data.get('Overall Score', 0)
+                
+                try:
+                    score = float(raw_score)
+                except (ValueError, TypeError):
+                    score = 0.0
+
+                # Top/Least Tickets tracking
+                valid_tickets.append({
+                    "Ticket ID": data.get('Ticket ID'),
+                    "Agent": agent,
+                    "Overall Score": score
+                })
+
+                # Agent Average tracking
+                if agent not in invalid_agents:
+                    if agent not in agent_scores:
+                        agent_scores[agent] = []
+                    agent_scores[agent].append(score)
+
+                # Pie Chart buckets
+                if score < 60: pie_counts[0] += 1
+                elif score < 80: pie_counts[60] += 1
+                elif score < 90: pie_counts[80] += 1
+                else: pie_counts[90] += 1
+
+                # Bar Chart (Dynamic JSON extraction)
+                for k, v in data.items():
+                    if k in active_criteria_names:
+                        status = str(v) if v is not None else "N/A"
+                        bar_counts[k][status] = bar_counts[k].get(status, 0) + 1
+
+            # 4. Format Output
+            agent_avgs = []
+            for agent, scores in agent_scores.items():
+                avg = sum(scores) / len(scores) if scores else 0
+                agent_avgs.append({"agent": agent, "score": round(avg, 2)})
+
+            # Sort agents
+            top_agents = sorted(agent_avgs, key=lambda x: x['score'], reverse=True)[:5]
+            least_agents = sorted(agent_avgs, key=lambda x: x['score'])[:5]
+
+            # Format Pie
             labels = {0: "Poor (<60)", 60: "Fair (60-80)", 80: "Good (80-90)", 90: "Excellent (90+)"}
-            pie_chart_data = [{"label": labels.get(d['_id'], "Other"), "value": d['count']} for d in raw_pie]
+            pie_chart_data = [{"label": labels[k], "value": v} for k, v in pie_counts.items()]
 
-            # A4. Bar Chart (FLAT Structure Logic)
-            bar_pipeline = [
-                {"$match": date_query},
-                {"$project": {"data_array": {"$objectToArray": "$$ROOT"}}},
-                {"$unwind": "$data_array"},
-                {"$match": {
-                    "data_array.k": {
-                        "$in": active_criteria_names
-                    }
-                }},
-                {"$group": {
-                    "_id": {"parameter": "$data_array.k", "status": {"$toString": {"$ifNull": ["$data_array.v", "N/A"]}}},
-                    "count": {"$sum": 1}
-                }},
-                {"$group": {
-                    "_id": "$_id.parameter",
-                    "statuses": {"$push": {"k": "$_id.status", "v": "$count"}}
-                }},
-                {"$project": {"_id": 0, "name": "$_id", "counts": {"$arrayToObject": "$statuses"}}},
-                {"$sort": {"name": 1}}
-            ]
-            bar_chart_data = list(mongo.db.audit_reports.aggregate(bar_pipeline))
+            # Format Bar
+            bar_chart_data = [{"name": k, "counts": v} for k, v in bar_counts.items() if v]
+            bar_chart_data.sort(key=lambda x: x['name'])
 
-            # A5. Ticket Details
-            projection = {'Ticket ID': 1, 'Agent': 1, 'Overall Score': 1, '_id': 0}
-            raw_top = list(mongo.db.audit_reports.find(date_query, projection).sort("Overall Score", -1).limit(5))
-            raw_least = list(mongo.db.audit_reports.find(date_query, projection).sort("Overall Score", 1).limit(5))
+            # Format Tickets
+            valid_tickets.sort(key=lambda x: x['Overall Score'])
+            least_tickets_raw = valid_tickets[:5]
+            top_tickets_raw = valid_tickets[::-1][:5]
 
             def format_tickets(t_list):
                 return [{
-                    "id": str(t.get("Ticket ID")), # Force string here
+                    "id": str(t.get("Ticket ID")), 
                     "agentName": t.get("Agent"), 
                     "score": t.get("Overall Score")
                 } for t in t_list]
@@ -153,92 +141,89 @@ def get_combined_dashboard_summary():
                 'bar_chart': bar_chart_data
             }
             tickets_output = {
-                'top_5_tickets': format_tickets(raw_top),
-                'least_5_tickets': format_tickets(raw_least)
+                'top_5_tickets': format_tickets(top_tickets_raw),
+                'least_5_tickets': format_tickets(least_tickets_raw)
             }
 
-       # ==========================================
+
+        # ==========================================
         # PATH B: CALL AUDIT
         # ==========================================
         elif category == 'call':
-            # 1. Helper Functions
+            # 1. Build Query
+            query = CallAuditResult.query.filter_by(project_code=project_code)
+            
+            # Call DB uses strictly parsed 'created_at' timestamps
+            if start_date_str and end_date_str:
+                s_date = datetime.strptime(start_date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+                e_date = datetime.strptime(end_date_str, '%Y-%m-%d').replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+                query = query.filter(CallAuditResult.created_at >= s_date, CallAuditResult.created_at <= e_date)
+            
+            records = query.all()
+            
+            # 2. Aggregation Variables
+            total_count = len(records)
+            agent_scores = {}
+            pie_counts = {0: 0, 60: 0, 80: 0, 90: 0}
+            bar_counts = {name: {} for name in active_criteria_names}
+
+            # 3. Process Records
+            for r in records:
+                agent = r.agent_name or "Unknown"
+                data = r.full_data or {}
+                raw_score = data.get('Overall Score', 0)
+                
+                try:
+                    score = float(raw_score)
+                except (ValueError, TypeError):
+                    score = 0.0
+
+                # Agent Average Tracking
+                if agent not in agent_scores:
+                    agent_scores[agent] = []
+                agent_scores[agent].append(score)
+
+                # Pie Chart buckets
+                if score < 60: pie_counts[0] += 1
+                elif score < 80: pie_counts[60] += 1
+                elif score < 90: pie_counts[80] += 1
+                else: pie_counts[90] += 1
+
+                # Bar Chart (Iterate Breakdown Array)
+                breakdown = data.get('Breakdown', [])
+                if isinstance(breakdown, list):
+                    for item in breakdown:
+                        param = item.get('Parameter')
+                        if param in active_criteria_names:
+                            status = str(item.get('Status', 'Unknown'))
+                            bar_counts[param][status] = bar_counts[param].get(status, 0) + 1
+
+            # 4. Format Output
+            agent_avgs = []
+            for agent, scores in agent_scores.items():
+                avg = sum(scores) / len(scores) if scores else 0
+                agent_avgs.append({"agent": agent, "score": round(avg, 2)})
+
+            # Sort agents
+            top_agents = sorted(agent_avgs, key=lambda x: x['score'], reverse=True)[:5]
+            least_agents = sorted(agent_avgs, key=lambda x: x['score'])[:5]
+
+            # Format Pie
+            labels = {0: "Poor (<60)", 60: "Fair (60-80)", 80: "Good (80-90)", 90: "Excellent (90+)"}
+            pie_chart_data = [{"label": labels[k], "value": v} for k, v in pie_counts.items()]
+
+            # Format Bar
+            bar_chart_data = [{"name": k, "counts": v} for k, v in bar_counts.items() if v]
+            bar_chart_data.sort(key=lambda x: x['name'])
+
+            # Format Tickets
             def format_for_ui(agg_list):
                 return [{
                     "id": "Agent", 
                     "agentName": a.get("agent") or "Unknown", 
                     "score": a.get("score") or 0
                 } for a in agg_list]
-            
-            # 2. Total Count
-            total_count = mongo.db.call_audit_results.count_documents(date_query)
 
-            # 3. Agent Aggregation (FIXED)
-            agent_pipeline = [
-                {"$match": date_query},
-                {"$group": {
-                    # 🟢 FIX: Group by the root-level 'agent_name' field
-                    "_id": "$agent_name", 
-                    "avg_score": {"$avg": "$full_data.Overall Score"}
-                }},
-                {"$project": {
-                    # If agent_name is missing, default to "Unknown"
-                    "agent": {"$ifNull": ["$_id", "Unknown"]}, 
-                    "score": {"$round": ["$avg_score", 2]}, 
-                    "_id": 0
-                }}
-            ]
-            
-            # Get Top 5
-            top_agents = list(mongo.db.call_audit_results.aggregate(
-                agent_pipeline + [{"$sort": {"score": -1}}, {"$limit": 5}]
-            ))
-            
-            # Get Least 5
-            least_agents = list(mongo.db.call_audit_results.aggregate(
-                agent_pipeline + [{"$sort": {"score": 1}}, {"$limit": 5}]
-            ))
-            
-            # 4. Pie Chart
-            pie_pipeline = [
-                {"$match": date_query},
-                {"$bucket": {
-                    "groupBy": "$full_data.Overall Score",
-                    "boundaries": [0, 60, 80, 90, 101],
-                    "default": "Other",
-                    "output": { "count": { "$sum": 1 } }
-                }}
-            ]
-            raw_pie = list(mongo.db.call_audit_results.aggregate(pie_pipeline))
-            labels = {0: "Poor (<60)", 60: "Fair (60-80)", 80: "Good (80-90)", 90: "Excellent (90+)"}
-            pie_chart_data = [{"label": labels.get(d['_id'], "Other"), "value": d['count']} for d in raw_pie]
-
-            # 5. Bar Chart
-            bar_pipeline = [
-                {"$match": date_query}, 
-                {"$unwind": "$full_data.Breakdown"}, 
-                {"$match": {
-                    "full_data.Breakdown.Parameter": {
-                        "$in": active_criteria_names
-                    }
-                }},
-                {"$group": {
-                    "_id": {
-                        "parameter": "$full_data.Breakdown.Parameter",
-                        "status": {"$toString": {"$ifNull": ["$full_data.Breakdown.Status", "Unknown"]}}
-                    },
-                    "count": {"$sum": 1}
-                }},
-                {"$group": {
-                    "_id": "$_id.parameter",
-                    "statuses": {"$push": {"k": "$_id.status", "v": "$count"}}
-                }},
-                {"$project": {"_id": 0, "name": "$_id", "counts": {"$arrayToObject": "$statuses"}}},
-                {"$sort": {"name": 1}}
-            ]
-            raw_bar_data = list(mongo.db.call_audit_results.aggregate(bar_pipeline))
-            bar_chart_data = [{"name": item['name'], **item.get('counts', {})} for item in raw_bar_data]
-
-            # 6. Prepare Final Output Objects
             stats_output = {
                 'total_audits': total_count,
                 'top_agents': top_agents,
@@ -247,16 +232,15 @@ def get_combined_dashboard_summary():
                 'bar_chart': bar_chart_data
             }
             
-            # Map unique aggregated agents to the Top/Least slots
             tickets_output = {
                 'top_5_tickets': format_for_ui(top_agents),
                 'least_5_tickets': format_for_ui(least_agents)
             }
-        # Handle invalid categories
+
         else:
             return jsonify({'error': 'Invalid category. Use "qa" or "call".'}), 400
 
-        # 3. Final JSON Return (Used by both Path A and Path B)
+        # 5. Final JSON Return
         return jsonify({
             'category': category,
             'stats': stats_output,
@@ -264,4 +248,6 @@ def get_combined_dashboard_summary():
         })
 
     except Exception as e:
+        import traceback
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
