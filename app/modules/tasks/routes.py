@@ -676,6 +676,9 @@ def save_audit_results():
 
             # Generate Excel
             try:
+                # 🟢 NEW: Rename the column strictly for the Excel output!
+                if 'Audit Date' in df_results.columns:
+                    df_results.rename(columns={'Audit Date': 'Processed At'}, inplace=True)
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     df_results.to_excel(writer, index=False, sheet_name='Results')

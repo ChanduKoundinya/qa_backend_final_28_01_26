@@ -107,6 +107,8 @@ def generate_docx_report(df, output_path,user_tz='UTC'):
     if 'Audit Date' in df_audit.columns:
         df_audit['Audit Date'] = pd.to_datetime(df_audit['Audit Date'], errors='coerce')
         # df_audit.dropna(subset=['Audit Date'], inplace=True) # Optional: Decide if you want to drop rows without dates
+        # 🟢 NEW: Rename the column for the final report tables!
+        df_audit.rename(columns={'Audit Date': 'Processed At'}, inplace=True)
 
     # Convert specific columns to string for consistency
     string_cols_audit = [
