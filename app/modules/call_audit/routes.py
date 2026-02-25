@@ -10,10 +10,12 @@ from datetime import datetime, timezone
 from flask import request, jsonify, current_app, g
 from flask_jwt_extended import jwt_required, get_jwt
 from sqlalchemy.orm.attributes import flag_modified
-
+import os
+import tempfile
+from app.utils.email_service import send_audit_email
 from . import call_audit_bp
 from app.engine.call_report import CallReportEngine
-
+from app.models import User
 # 🟢 POSTGRESQL MODELS IMPORT
 from app.models import db, Task, Criterion, ApiConfig, CallAuditResult, StoredFile
 
@@ -287,9 +289,12 @@ def save_call_results():
                     for item in breakdown:
                         param = item.get("Parameter")
                         if param:
-                            # The Casing Fix from earlier
+                            # 🟢 FIX: Normalize the parameter name to Title Case
+                            # This turns "Politeness to customer" -> "Politeness To Customer"
                             normalized_param = param.strip().title()
-                            flat_doc[normalized_param] = item 
+                            flat_doc[normalized_param] = item
+                                        
+                processed_for_engine.append(flat_doc)
                 
                 processed_for_engine.append(flat_doc)
 
@@ -316,6 +321,76 @@ def save_call_results():
                 task.output_excel_id = new_file.id
                 task.completed_at = get_utc_now()
                 db.session.commit()
+
+            engine = CallReportEngine()
+            excel_output = engine.generate_excel(processed_for_engine, user_tz)
+            
+            if excel_output:
+                filename_report = f"call_audit_Report_{main_task_id}.xlsx"
+                
+                # 🟢 GRIDFS REPLACEMENT: Save Excel to StoredFile (BYTEA)
+                excel_output.seek(0)
+                file_bytes = excel_output.read() # Read once into a variable
+                
+                new_file = StoredFile(
+                    filename=filename_report,
+                    mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                    file_data=file_bytes,
+                    project_code=project_code
+                )
+                db.session.add(new_file)
+                db.session.flush() # Get ID without committing transaction
+                
+                # Update task with File ID
+                task.status = 'complete'
+                task.output_excel_id = new_file.id
+                task.completed_at = get_utc_now()
+                db.session.commit()
+
+                # ==========================================
+                # 🟢 NEW EMAIL TRIGGER LOGIC
+                # ==========================================
+                logging.info(f"Task {main_task_id} saved to DB. Triggering email notification...")
+
+                # Create a temporary file on the VM's disk to attach to the email
+                temp_dir = tempfile.gettempdir()
+                temp_file_path = os.path.join(temp_dir, filename_report)
+                
+                with open(temp_file_path, 'wb') as f:
+                    f.write(file_bytes)
+
+                uploader = User.query.filter_by(username=task.created_by).first()
+
+                if uploader and uploader.email:
+                    recipient = uploader.email
+                else:
+                    recipient = "subhashini54860@gmail.com" # Fallback just in case
+
+                subject = f"Call Audit Completed - Task #{main_task_id}"
+                body = (
+                    f"Hello,\n\n"
+                    f"The Call Audit for Task #{main_task_id} has been successfully completed.\n"
+                    f"Please find the attached audit report.\n\n"
+                    f"Best regards,\nQA Bot System"
+                )
+
+                # Send the email
+                email_sent = send_audit_email(
+                    recipient_email=recipient,
+                    subject=subject,
+                    body_text=body,
+                    file_path=temp_file_path 
+                )
+                
+                # Clean up the temporary file from the server so it doesn't waste disk space
+                if os.path.exists(temp_file_path):
+                    os.remove(temp_file_path)
+
+                if email_sent:
+                    logging.info(f"📧 Email successfully sent to {recipient}")
+                else:
+                    logging.error(f"❌ Failed to send email for Task {main_task_id}")
+                # ==========================================
 
         return jsonify({"status": "success"}), 200
 

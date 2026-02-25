@@ -12,5 +12,13 @@ class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev_key")
     CORE_SERVICE_URL = os.getenv("CORE_SERVICE_URL")
     WEB_URL = os.getenv("WEB_URL")
+
+    SQLALCHEMY_ENGINE_OPTIONS = {
+        # Tests the connection by running a simple "SELECT 1" before executing your real query
+        "pool_pre_ping": True, 
+        
+        # Recycles connections every 5 minutes (300 seconds) so they never sit idle long enough for Neon to kill them
+        "pool_recycle": 300,   
+    }
     
     SQLALCHEMY_TRACK_MODIFICATIONS = False
