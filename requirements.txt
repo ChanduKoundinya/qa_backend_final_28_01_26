@@ -1,16 +1,31 @@
+# Web Framework & Production Server
 Flask
 Flask-Cors
-Flask-PyMongo
-pymongo
-python-dotenv
+flask-jwt-extended
+flask_bcrypt
+gunicorn  # 🟢 Required for Production
+
+# Database (PostgreSQL / Neon)
+Flask-SQLAlchemy
+psycopg2-binary
+
+# Task Scheduling
 APScheduler
+flask_apscheduler
+
+# Data Processing & AI
+pandas
+xlsxwriter
+openai
+spacy
+httpx
+
+# Visualization & Reporting
+python-docx
+matplotlib
+seaborn
+
+# Utilities
+python-dotenv
 requests
 pytz
-pandas
-python-docx 
-matplotlib 
-seaborn
-flask-jwt-extended
-flask_apscheduler
-xlsxwriter
-spacy
