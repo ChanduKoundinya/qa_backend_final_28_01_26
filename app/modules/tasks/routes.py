@@ -7,7 +7,7 @@ import ast
 import io
 import re
 import tempfile 
-
+import pytz
 from flask import request, jsonify, send_file, current_app, g
 import pandas as pd
 from flask_jwt_extended import jwt_required, get_jwt
@@ -553,6 +553,9 @@ def save_audit_results():
 
             # Generate Excel
             try:
+                if 'Audit Date' in df_results.columns:
+                    df_results.rename(columns={'Audit Date': 'Processed At'}, inplace=True)
+
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                     df_results.to_excel(writer, index=False, sheet_name='Results')
@@ -769,6 +772,7 @@ def save_pii_logs():
             return jsonify({"error": "Missing task_id"}), 400
 
         project_code = "default"
+        real_task_id = raw_task_id
         
         if "___" in raw_task_id:
             try:
@@ -777,9 +781,22 @@ def save_pii_logs():
             except ValueError:
                 return jsonify({"error": "Invalid ID format"}), 400
 
-        # Save to Postgres
+        # 🟢 1. FETCH USER TIMEZONE FROM THE MASTER TASK
+        user_tz_str = 'UTC' # Default fallback
+        if real_task_id.isdigit():
+            task = Task.query.get(int(real_task_id))
+            if task and task.user_tz:
+                user_tz_str = task.user_tz
+                
+        # 🟢 2. CONVERT CURRENT TIME TO USER'S LOCAL TIMEZONE
+        target_tz = pytz.timezone(user_tz_str)
+        # Get UTC time, convert to target timezone, and strip tzinfo so Postgres saves the exact local numbers
+        local_time = datetime.now(timezone.utc).astimezone(target_tz).replace(tzinfo=None)
+
+        # 🟢 3. SAVE TO POSTGRES WITH THE LOCAL TIMESTAMP
         new_log = PiiLog(
             task_id=log_entry.get('task_id'),
+            timestamp=local_time,  # Inject the local time here
             status=log_entry.get('status'),
             pii_found=log_entry.get('pii_found', False),
             detection_stats=log_entry.get('detection_stats', {}),
@@ -789,13 +806,12 @@ def save_pii_logs():
         db.session.add(new_log)
         db.session.commit()
 
-        return jsonify({"status": "success", "message": "PII Log Saved"}), 200
+        return jsonify({"status": "success", "message": "PII Log Saved in Local Time"}), 200
 
     except Exception as e:
         db.session.rollback()
         logging.error(f"❌ Failed to save PII Log: {e}")
         return jsonify({"error": str(e)}), 500
-
 
 @tasks_bp.route('/api/pii-logs', methods=['GET'])
 @jwt_required()
