@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify, g
 from config import Config
+import re
 from werkzeug.security import generate_password_hash, check_password_hash
 from flask_jwt_extended import (
     create_access_token, 
@@ -34,27 +35,50 @@ def format_to_iso_z(dt):
 def register():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided in request"}), 400
         
-        # 1. Validation
-        required = ['username', 'email', 'password', 'role', 'project']
-        if not all(k in data for k in required):
-            return jsonify({"error": "Missing fields"}), 400
+        # 🟢 1. STRICT VALIDATION: Check for missing OR empty fields
+        required_fields = ['username', 'email', 'password', 'role', 'project']
+        missing_fields = []
+        
+        for field in required_fields:
+            # If the key doesn't exist, OR if it's just an empty string/spaces
+            if field not in data or not str(data[field]).strip():
+                missing_fields.append(field)
+                
+        # If any fields are missing, reject the request immediately
+        if missing_fields:
+            return jsonify({
+                "error": "Missing or empty mandatory fields", 
+                "missing_fields": missing_fields
+            }), 400
 
-        project_code = data['project']
+        # Now it is 100% safe to extract and clean the variables
+        username = data['username'].strip()
+        email = data['email'].strip()
+        password = data['password']  # We don't strip passwords; spaces might be intentional!
+        role = data['role'].strip()
+        project_code = data['project'].strip()
 
-        # 2. Check for duplicates in Postgres
-        existing_user = User.query.filter_by(email=data['email']).first()
+        # 🟢 2. Validate Email Format using Regex
+        email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+        if not re.match(email_regex, email):
+            return jsonify({"error": "Invalid email format"}), 400
+
+        # 3. Check for duplicates in Postgres
+        existing_user = User.query.filter_by(email=email).first()
         if existing_user:
             return jsonify({"error": "Email already registered"}), 409
 
-        hashed_password = generate_password_hash(data['password'])
+        hashed_password = generate_password_hash(password)
 
-        # 3. Save to Postgres
+        # 4. Save to Postgres
         new_user = User(
-            username=data['username'],
-            email=data['email'],
+            username=username,
+            email=email,
             password=hashed_password,
-            role=data['role'],
+            role=role,
             project_code=project_code,
             is_active=True,
             created_at=get_utc_now()
@@ -63,12 +87,11 @@ def register():
         db.session.add(new_user)
         db.session.commit()
 
-        return jsonify({"message": "User registered in system"}), 201
+        return jsonify({"message": "User registered successfully"}), 201
 
     except Exception as e:
         db.session.rollback()
         return jsonify({"error": str(e)}), 500
-
 
 # ==========================================
 # 2. LOGIN
