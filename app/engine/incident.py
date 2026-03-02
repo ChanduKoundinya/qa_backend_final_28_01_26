@@ -126,21 +126,22 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         else:
             write_dummy_data('1_Top_Talkers', 'Missing Type/Priority columns or empty data')
 
-    # 2. Closed Trend
-    # 2. Closed Trend (UPDATED TO USE RESOLVED TIME AS FALLBACK)
+    # 2. Closed Trend (UPDATED TO DAILY TREND)
     if '2' in active_features:
         if not df_closed.empty and global_time_col:
-            df_closed['Month'] = df_closed[global_time_col].dt.to_period('M').astype(str)
-            data = df_closed.groupby('Month')['Ticket Id'].count().reset_index(name='Count')
+            # Extract just the Date (YYYY-MM-DD) for daily grouping
+            df_closed['Date'] = df_closed[global_time_col].dt.strftime('%Y-%m-%d')
+            data = df_closed.groupby('Date')['Ticket Id'].count().reset_index(name='Count')
             data.to_excel(writer, sheet_name='2_Closed_Trend', index=False)
-            add_chart('2_Closed_Trend', data, 1, 'Closed/Resolved Ticket Trend', 'line')
+            add_chart('2_Closed_Trend', data, 1, 'Daily Closed/Resolved Ticket Trend', 'line')
         else:
             write_dummy_data('2_Closed_Trend', 'Missing valid dates in both Closed Time and Resolved Time columns.')
 
-    # 3. Agent Rank
+    # 3. Agent Rank (UPDATED TO SORT BY HIGHEST COUNT)
     if '3' in active_features:
         if {'Group', 'Agent', 'Ticket Id'}.issubset(df.columns) and not df.empty:
-            data = df.groupby(['Group', 'Agent'])['Ticket Id'].count().reset_index(name='Count')
+            # 🟢 Added .sort_values() to rank from highest to lowest
+            data = df.groupby(['Group', 'Agent'])['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
             data.to_excel(writer, sheet_name='3_Agent_Rank', index=False)
             add_chart('3_Agent_Rank', data, 2, 'Agent Volume by Group')
         else:
@@ -164,16 +165,21 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         else:
             write_dummy_data('5_FCR_Analysis', 'Missing Agent data for FCR')
 
-    # 6. Aging
+    # 6. Aging (UPDATED TO SHOW ALL OPEN TICKETS)
     if '6' in active_features:
         if not df_open.empty and 'Created Time' in df.columns:
             df_open['Days'] = (current_date - df_open['Created Time']).dt.days
-            data = df_open[['Ticket Id', 'Days']].sort_values('Days', ascending=False).head(20)
+            
+            # 🟢 Removed .head(20) so it includes EVERY open ticket
+            data = df_open[['Ticket Id', 'Days']].sort_values('Days', ascending=False)
+            
             data.to_excel(writer, sheet_name='6_Aging', index=False)
-            add_chart('6_Aging', data, 1, 'Top 20 Oldest Tickets')
+            
+            # 🟢 Updated the chart title to reflect all tickets
+            add_chart('6_Aging', data, 1, 'Aging of All Open Tickets')
         else:
             write_dummy_data('6_Aging', 'No Open Tickets or missing Created Time')
-
+            
     # 7. MTTR
     mttr_overall = 0
     if '7' in active_features:
@@ -186,16 +192,22 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         else:
             write_dummy_data('7_MTTR', 'Missing Resolution Time data')
 
-    # 8. Open Trend
+    # 8. Open Trend (UPDATED TO DAILY TREND)
     if '8' in active_features:
         if 'Created Time' in df.columns and not df.empty:
             start_date = df['Created Time'].min()
             if pd.notna(start_date):
-                months = pd.date_range(start=start_date, end=current_date, freq='ME')
-                counts = [((df['Created Time'] <= m) & ((df['Closed Time'] > m) | df['Closed Time'].isnull())).sum() for m in months]
-                data = pd.DataFrame({'Month': [m.strftime('%Y-%m') for m in months], 'Open Tickets': counts})
+                # 🟢 Changed freq='ME' to freq='D' to generate a list of every single day
+                days = pd.date_range(start=start_date, end=current_date, freq='D')
+                
+                # Check how many tickets were open on each specific day
+                counts = [((df['Created Time'] <= d) & ((df['Closed Time'] > d) | df['Closed Time'].isnull())).sum() for d in days]
+                
+                # 🟢 Changed column name to 'Date' and format to YYYY-MM-DD
+                data = pd.DataFrame({'Date': [d.strftime('%Y-%m-%d') for d in days], 'Open Tickets': counts})
+                
                 data.to_excel(writer, sheet_name='8_Open_Trend', index=False)
-                add_chart('8_Open_Trend', data, 1, 'Open Backlog Trend', 'line')
+                add_chart('8_Open_Trend', data, 1, 'Daily Open Backlog Trend', 'line')
             else:
                 write_dummy_data('8_Open_Trend', 'Invalid dates in Created Time')
         else:

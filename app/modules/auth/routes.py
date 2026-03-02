@@ -288,12 +288,30 @@ def update_user(user_id):
 
         has_updates = False
 
+        # 🟢 NEW: Update Username
+        if 'username' in data:
+            new_username = str(data['username']).strip()
+            if not new_username:
+                return jsonify({"error": "Username cannot be empty"}), 400
+            user.username = new_username
+            has_updates = True
+
+        # 🟢 NEW: Update Project
+        if 'project' in data:
+            new_project = str(data['project']).strip()
+            if not new_project:
+                return jsonify({"error": "Project cannot be empty"}), 400
+            user.project_code = new_project  # Use whatever your DB column is named
+            has_updates = True
+
+        # Existing: Update Role
         if 'role' in data:
-            if data['role'] not in ['superadmin', 'admin', 'manager', 'user']:
+            if data['role'] not in ['superadmin', 'admin', 'manager', 'agent', 'user']:
                 return jsonify({"error": "Invalid role provided"}), 400
             user.role = data['role']
             has_updates = True
 
+        # Existing: Update Active Status
         if 'is_active' in data:
             user.is_active = bool(data['is_active'])
             has_updates = True
@@ -303,12 +321,14 @@ def update_user(user_id):
 
         db.session.commit()
 
+        # Return the newly updated data to the frontend
         return jsonify({
             "message": "User updated successfully",
             "user": {
                 "id": str(user.id),
                 "username": user.username,
                 "role": user.role,
+                "project": user.project_code, # 🟢 Added to response
                 "is_active": user.is_active
             }
         }), 200

@@ -104,7 +104,7 @@ def background_worker(app, project_code, file_data_list, main_task_id, api_key, 
             }
 
             logging.info(f" 📤 Sending BATCH of {len(files_to_send)} files to Core simultaneously...")
-            response = requests.post(core_url, files=files_to_send, data=data, timeout=600)
+            response = requests.post(core_url, files=files_to_send, data=data, timeout=30000)
 
             if response.status_code == 200:
                 logging.info(" ✅ Core successfully accepted the batch!")
