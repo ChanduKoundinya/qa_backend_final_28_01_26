@@ -117,15 +117,22 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
 
     # --- 3. Original Features (1-10) ---
     
-    # 1. Top Talkers
+    # 1. Top Talkers (UPDATED TO CATEGORY BY GROUP)
     if '1' in active_features:
-        if {'Type', 'Priority', 'Ticket Id'}.issubset(df.columns) and not df.empty:
-            data = df.groupby(['Type', 'Priority'])['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
+        # 🟢 Changed the required columns check to look for Category and Group
+        if {'Category', 'Group', 'Ticket Id'}.issubset(df.columns) and not df.empty:
+            
+            # 🟢 Changed the groupby to use Category and Group
+            data = df.groupby(['Category', 'Group'])['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
+            
             data.to_excel(writer, sheet_name='1_Top_Talkers', index=False)
-            add_chart('1_Top_Talkers', data, 2, 'Top Types by Priority')
+            
+            # 🟢 Updated the chart title to match the new data
+            add_chart('1_Top_Talkers', data, 2, 'Top Categories by Group')
         else:
-            write_dummy_data('1_Top_Talkers', 'Missing Type/Priority columns or empty data')
-
+            # 🟢 Updated the error message
+            write_dummy_data('1_Top_Talkers', 'Missing Category/Group columns or empty data')
+                    
     # 2. Closed Trend (UPDATED TO DAILY TREND)
     if '2' in active_features:
         if not df_closed.empty and global_time_col:
@@ -179,7 +186,7 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
             add_chart('6_Aging', data, 1, 'Aging of All Open Tickets')
         else:
             write_dummy_data('6_Aging', 'No Open Tickets or missing Created Time')
-            
+
     # 7. MTTR
     mttr_overall = 0
     if '7' in active_features:
