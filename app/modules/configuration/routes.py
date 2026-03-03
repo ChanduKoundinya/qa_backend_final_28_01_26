@@ -347,3 +347,54 @@ def delete_criterion(crit_id):
     except Exception as e:
         db.session.rollback()
         return api_response(message="Internal Server Error", status=500)
+
+@config_bp.route('/api/configs/email-toggle', methods=['GET'])
+@jwt_required()
+def get_email_toggle():
+    """Fetch the current status of email notifications."""
+    try:
+        claims = get_jwt()
+        project_code = claims.get('project')
+        
+        config = ApiConfig.query.filter_by(name="email_notifications", project_code=project_code).first()
+        
+        # Default to True if it hasn't been set yet
+        is_enabled = True if not config else (config.key == "true")
+        
+        return api_response(data={"email_notifications_enabled": is_enabled}, message="Success")
+    except Exception as e:
+        return api_response(message=str(e), status=500)
+
+@config_bp.route('/api/configs/email-toggle', methods=['POST'])
+@jwt_required()
+@role_required(['superadmin', 'admin']) # Only allow admins to change this
+def update_email_toggle():
+    """Update the status of email notifications."""
+    try:
+        claims = get_jwt()
+        project_code = claims.get('project')
+        data = request.get_json()
+        
+        # Expecting {"enabled": true} or {"enabled": false} from frontend
+        is_enabled = data.get("enabled", True) 
+        
+        config = ApiConfig.query.filter_by(name="email_notifications", project_code=project_code).first()
+        
+        if not config:
+            # Create it if it doesn't exist
+            config = ApiConfig(
+                name="email_notifications", 
+                category="System Settings", 
+                project_code=project_code
+            )
+            db.session.add(config)
+        
+        # Update the key
+        config.key = "true" if is_enabled else "false"
+        config.updated_at = get_utc_now()
+        db.session.commit()
+        
+        return api_response(data={"enabled": is_enabled}, message="Email settings updated successfully")
+    except Exception as e:
+        db.session.rollback()
+        return api_response(message=str(e), status=500)

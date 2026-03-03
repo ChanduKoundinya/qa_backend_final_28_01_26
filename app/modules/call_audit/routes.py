@@ -14,14 +14,21 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from . import call_audit_bp
 from app.engine.call_report import CallReportEngine
-from app.utils.email_service import send_audit_email
-
+from app.utils.email_service import send_audit_email, trigger_automated_email
 # 🟢 POSTGRESQL MODELS IMPORT
 from app.models import db, Task, Criterion, ApiConfig, CallAuditResult, StoredFile, User
 
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
+
+def is_email_enabled(project_code):
+    config = ApiConfig.query.filter_by(name="email_notifications", project_code=project_code).first()
+    if config and config.key == "false":
+        return False
+    return True
+
+
 def get_utc_now():
     """Returns current time in UTC, timezone-aware."""
     return datetime.now(timezone.utc)
@@ -344,7 +351,7 @@ def save_call_results():
                 # ==========================================
                 # 🟢 NEW EMAIL TRIGGER LOGIC
                 # ==========================================
-                logging.info(f"Task {main_task_id} saved to DB. Triggering email notification...")
+                logging.info(f"Task {main_task_id} completed. Checking email triggers...")
 
                 temp_dir = tempfile.gettempdir()
                 temp_file_path = os.path.join(temp_dir, filename_report)
@@ -352,35 +359,13 @@ def save_call_results():
                 with open(temp_file_path, 'wb') as f:
                     f.write(file_bytes)
 
-                uploader = User.query.filter_by(username=task.created_by).first()
+                # 🟢 Call the centralized helper function
+                # (It handles the toggle check, user validation, and audit logging!)
+                trigger_automated_email(task, project_code, [temp_file_path])
 
-                if uploader and getattr(uploader, 'email', None):
-                    recipient = uploader.email
-                else:
-                    recipient = "subhashini54860@gmail.com"
-
-                subject = f"Call Audit Completed - Task #{main_task_id}"
-                body = (
-                    f"Hello,\n\n"
-                    f"The Call Audit for Task #{main_task_id} has been successfully completed.\n"
-                    f"Please find the attached audit report.\n\n"
-                    f"Best regards,\nQA Bot System"
-                )
-
-                email_sent = send_audit_email(
-                    recipient_email=recipient,
-                    subject=subject,
-                    body_text=body,
-                    file_path=temp_file_path 
-                )
-                
+                # Cleanup the temp file
                 if os.path.exists(temp_file_path):
                     os.remove(temp_file_path)
-
-                if email_sent:
-                    logging.info(f"📧 Email successfully sent to {recipient}")
-                else:
-                    logging.error(f"❌ Failed to send email for Task {main_task_id}")
                 # ==========================================
 
         return jsonify({"status": "success"}), 200

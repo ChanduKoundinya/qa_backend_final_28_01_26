@@ -19,7 +19,8 @@ from app.extensions import scheduler
 from . import tasks_bp
 
 # 🟢 POSTGRESQL MODELS IMPORT
-from app.models import db, Task, StoredFile, AuditReport, IncidentResult, ApiConfig, Criterion, PiiLog
+from app.models import db, Task, StoredFile, AuditReport, IncidentResult, ApiConfig, Criterion, PiiLog, User
+from app.utils.email_service import send_audit_email, trigger_automated_email
 
 def api_response(data=None, message="", status=200):
     return jsonify({
@@ -107,8 +108,24 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                     db.session.add(incident_result)
                     db.session.commit()
 
+                    logging.info(f"Task {task_id} completed. Checking email triggers...")
+                    
+                    temp_dir = tempfile.gettempdir()
+                    temp_file_path = os.path.join(temp_dir, filename)
+                    
+                    with open(temp_file_path, 'wb') as f:
+                        f.write(new_excel_file.file_data)
+
+                    # 🟢 Call the centralized helper function
+                    trigger_automated_email(task, project_code, [temp_file_path])
+                    
+                    # Cleanup the temp file
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                    # ==========================================
+
                     logging.info(f"✅ Local Incident Processing Complete for {task_id}")
-                    return 
+                    return
 
                 except Exception as local_e:
                     db.session.rollback()
@@ -608,6 +625,37 @@ def save_audit_results():
             task.completed_at = get_utc_now()
             db.session.commit()
 
+            if excel_id:
+                logging.info(f"Task {task_id} completed. Checking email triggers...")
+                
+                temp_dir = tempfile.gettempdir()
+                files_to_attach = []
+                
+                # Fetch and write Excel file
+                stored_excel = StoredFile.query.get(excel_id)
+                if stored_excel:
+                    temp_excel_path = os.path.join(temp_dir, stored_excel.filename)
+                    with open(temp_excel_path, 'wb') as f:
+                        f.write(stored_excel.file_data)
+                    files_to_attach.append(temp_excel_path)
+                
+                # Fetch and write DOCX file (if it exists)
+                if docx_id:
+                    stored_docx = StoredFile.query.get(docx_id)
+                    if stored_docx:
+                        temp_docx_path = os.path.join(temp_dir, stored_docx.filename)
+                        with open(temp_docx_path, 'wb') as f:
+                            f.write(stored_docx.file_data)
+                        files_to_attach.append(temp_docx_path)
+
+                # 🟢 Call the centralized helper function
+                trigger_automated_email(task, project_code, files_to_attach)
+                
+                # Cleanup the temp files
+                for file_path in files_to_attach:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+
         return jsonify({"message": "Saved successfully"}), 200
 
     except Exception as e:
@@ -630,6 +678,7 @@ def upload_incident_report():
         claims = get_jwt()
         current_project = claims.get('project')
         user_tz = request.form.get('timezone', 'UTC')
+        username = claims.get("username", "Unknown User")
 
         file_pos = file.tell()
         header = file.read(8)
@@ -709,6 +758,7 @@ def upload_incident_report():
             # 5. Hardcoded Active Features
             feats = [str(i) for i in range(1, 18)]
 
+
             # 6. Create Task
             new_task = Task(
                 filename=file.filename,
@@ -717,7 +767,8 @@ def upload_incident_report():
                 analysis_type="incident_report",
                 user_tz=user_tz,
                 total_files=len(df),
-                project_code=current_project
+                project_code=current_project,
+                created_by=username
             )
             db.session.add(new_task)
             db.session.commit()
