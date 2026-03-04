@@ -148,3 +148,15 @@ class IncidentResult(db.Model):
     file_name = db.Column(db.String(255))
     project_code = db.Column(db.String(50), nullable=False)
     generated_at = db.Column(db.DateTime, default=get_utc_now)
+
+class SummaryTrigger(db.Model):
+    __tablename__ = 'summary_triggers'
+    id = db.Column(db.Integer, primary_key=True)
+    is_active = db.Column(db.Boolean, default=True)
+    frequency = db.Column(db.String(20)) # 'Daily', 'Weekly', 'Monthly'
+    delivery_time = db.Column(db.Time)    # e.g., 09:00:00
+    day_of_week = db.Column(db.String(10), nullable=True) # For Weekly (e.g., 'Monday')
+    day_of_month = db.Column(db.Integer, nullable=True)  # For Monthly (e.g., 1)
+    project_code = db.Column(db.String(50))
+    created_by = db.Column(db.String(100))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)

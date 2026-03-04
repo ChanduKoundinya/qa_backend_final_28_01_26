@@ -12,14 +12,14 @@ from flask import request, jsonify, send_file, current_app, g
 import pandas as pd
 from flask_jwt_extended import jwt_required, get_jwt
 from sqlalchemy import or_
-
+from datetime import timedelta
 from app.engine.incident import generate_incident_report
 from app.engine.reporting import generate_docx_report
 from app.extensions import scheduler
 from . import tasks_bp
 
 # 🟢 POSTGRESQL MODELS IMPORT
-from app.models import db, Task, StoredFile, AuditReport, IncidentResult, ApiConfig, Criterion, PiiLog, User
+from app.models import db, Task, StoredFile, AuditReport, IncidentResult, ApiConfig, Criterion, PiiLog, User, CallAuditResult
 from app.utils.email_service import send_audit_email, trigger_automated_email
 
 def api_response(data=None, message="", status=200):
@@ -911,3 +911,185 @@ def get_pii_logs():
     except Exception as e:
         logging.error(f"❌ Error fetching PII logs: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+    
+
+def generate_and_send_summary(project_code, frequency="daily", recipient_list=None):
+    """Calculates metrics dynamically, separated by Call, Ticket, and Incident."""
+    logging.info(f"📊 Generating {frequency.upper()} Summary Report for Project: {project_code}")
+    
+    if not recipient_list:
+        logging.warning(f"⚠️ No recipients provided. Summary skipped.")
+        return
+
+    # 🟢 ROLLING WINDOW LOGIC (Exactly preceding 24 hours/7 days/30 days)
+    end_time = get_utc_now() # The exact millisecond the scheduled trigger fires
+    
+    # 🟢 DYNAMIC TIME WINDOW BASED ON FREQUENCY
+    if frequency == "weekly":
+        start_time = end_time - timedelta(days=7)
+        title_prefix = "Weekly"
+        time_text = "for the past 7 days"
+    elif frequency == "monthly":
+        start_time = end_time - timedelta(days=30)
+        title_prefix = "Monthly"
+        time_text = "for the past 30 days"
+    else:
+        start_time = end_time - timedelta(days=1)
+        title_prefix = "Daily"
+        time_text = "for the past 24 hours"
+
+    # Query the database using the dynamic rolling bounds
+    tasks = Task.query.filter(
+        Task.project_code == project_code,
+        Task.status == 'complete',
+        Task.completed_at >= start_time,
+        Task.completed_at <= end_time
+    ).all()
+
+    # 🟢 SEPARATE TRACKERS FOR EACH CATEGORY
+    metrics = {
+        'call': {'total': 0, 'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0},
+        'ticket': {'total': 0, 'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0},
+        'incident': {'total': 0, 'excellent': 0, 'good': 0, 'fair': 0, 'poor': 0} # Incidents don't use AI scores, but we track volume
+    }
+
+    for t in tasks:
+        # Determine Category
+        if t.analysis_type == 'incident_report':
+            cat = 'incident'
+            # Incidents don't have AI rows, so we use the total files/rows processed
+            metrics[cat]['total'] += (t.total_files or 0)
+            continue # Skip scoring for incidents
+            
+        elif t.audit_category == 'call audit':
+            cat = 'call'
+            records = CallAuditResult.query.filter_by(task_id=t.id).all()
+        else:
+            cat = 'ticket'
+            records = AuditReport.query.filter_by(task_id=t.id).all()
+
+        # Tally Scores for Calls and Tickets
+        for r in records:
+            metrics[cat]['total'] += 1
+            data = r.full_data or {}
+            raw_score = data.get('Overall Score') or data.get('score') or 0
+            
+            try:
+                score = float(raw_score)
+            except (ValueError, TypeError):
+                score = 0.0
+
+            if score >= 90: metrics[cat]['excellent'] += 1
+            elif score >= 80: metrics[cat]['good'] += 1
+            elif score >= 60: metrics[cat]['fair'] += 1
+            else: metrics[cat]['poor'] += 1
+
+    # 🟢 HTML TEMPLATE GENERATOR FOR EACH SECTION
+    def build_html_section(title, data, show_scores=True):
+        if data['total'] == 0:
+            return "" # Hide empty sections
+            
+        html = f"""
+        <div style="margin-bottom: 30px;">
+            <h3 style="color: #2C3E50; border-bottom: 2px solid #ddd; padding-bottom: 5px;">{title}</h3>
+            <p style="font-size: 16px;"><strong>Total Volume Processed:</strong> {data['total']}</p>
+        """
+        
+        if show_scores:
+            html += f"""
+            <table style="border-collapse: collapse; width: 100%; max-width: 500px; margin-top: 10px;">
+                <tr style="background-color: #2980B9; color: white;">
+                    <th style="padding: 10px; border: 1px solid #ddd; text-align: left;">Performance Tier</th>
+                    <th style="padding: 10px; border: 1px solid #ddd; text-align: center;">Count</th>
+                </tr>
+                <tr><td style="padding: 10px; border: 1px solid #ddd;">🟢 Excellent (90 - 100)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;"><b>{data['excellent']}</b></td></tr>
+                <tr><td style="padding: 10px; border: 1px solid #ddd;">🟡 Good (80 - 89)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;"><b>{data['good']}</b></td></tr>
+                <tr><td style="padding: 10px; border: 1px solid #ddd;">🟠 Fair (60 - 79)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;"><b>{data['fair']}</b></td></tr>
+                <tr><td style="padding: 10px; border: 1px solid #ddd;">🔴 Needs Retrain (< 60)</td><td style="padding: 10px; border: 1px solid #ddd; text-align: center;"><b>{data['poor']}</b></td></tr>
+            </table>
+            """
+        html += "</div>"
+        return html
+
+    # Build the full HTML body
+    call_html = build_html_section("📞 Call Audit Performance", metrics['call'])
+    ticket_html = build_html_section("🎫 Ticket Audit Performance", metrics['ticket'])
+    incident_html = build_html_section("⚠️ Incident Analysis Volume", metrics['incident'], show_scores=False) # No AI scores for incident data
+    
+    # If absolutely nothing was processed
+    if not (call_html or ticket_html or incident_html):
+        body_content = "<p>No audits or incidents were processed during this time period.</p>"
+    else:
+        body_content = call_html + ticket_html + incident_html
+
+    final_html = f"""
+    <html>
+        <body style="font-family: Arial, sans-serif; color: #333; padding: 20px;">
+            <h2 style="color: #2C3E50;">{title_prefix} Quality Summary - {project_code.upper()}</h2>
+            <p style="color: #555; font-size: 16px;">Performance snapshot <strong>{time_text}</strong>.</p>
+            {body_content}
+        </body>
+    </html>
+    """
+
+    # Dispatch via upgraded email service
+    success = send_audit_email(
+        recipient_email=recipient_list,
+        subject=f"{title_prefix} Quality Summary - {project_code.upper()}",
+        body_text="Your email client does not support HTML.",
+        body_html=final_html
+    )
+    
+    # 🟢 EXPLICIT MAIL SENT LOG
+    if success:
+        logging.info(f"✅ MAIL SENT LOG: {title_prefix} Summary successfully delivered to {len(recipient_list)} recipients: {recipient_list}")
+    else:
+        logging.error(f"❌ MAIL FAILED LOG: Could not dispatch {title_prefix} Summary to {recipient_list}")
+
+def evaluate_summary_triggers(app):
+    """CRON JOB: Runs every minute and evaluates Daily/Weekly/Monthly triggers."""
+    with app.app_context():
+        now = datetime.now()
+        current_time_str = now.strftime("%H:%M") # Format: "09:00"
+        current_day = now.strftime("%A")         # Format: "Friday"
+        current_date = str(now.day)              # Format: "3"
+
+        configs = ApiConfig.query.filter_by(name="summary_notification_settings").all()
+        
+        for config in configs:
+            if config.key == "false" or not config.tools: 
+                continue 
+                
+            settings = config.tools
+            if not settings.get("summaryEnabled"): 
+                continue
+
+            triggers = settings.get("triggers", [])
+            
+            # 🟢 NEW: Extract exactly the emails saved in the frontend list
+            raw_recipients = settings.get("recipients", [])
+            recipient_emails = [r.get("email") for r in raw_recipients if r.get("email")]
+
+            # If the list is empty, don't bother calculating anything
+            if not recipient_emails:
+                logging.warning(f"⚠️ No recipients configured for project {config.project_code}. Skipping summary.")
+                continue
+            
+            for t in triggers:
+                if not t.get("status"): 
+                    continue 
+                    
+                if t.get("time") != current_time_str: 
+                    continue 
+
+                freq = str(t.get("frequency")).lower()
+                
+                # 🟢 Pass the recipient_emails array to the generator
+                if freq == "daily":
+                    generate_and_send_summary(config.project_code, "daily", recipient_emails)
+                
+                elif freq == "weekly" and str(t.get("dayOfWeek")).lower() == current_day.lower():
+                    generate_and_send_summary(config.project_code, "weekly", recipient_emails)
+                
+                elif freq == "monthly" and str(t.get("dateOfMonth")) == current_date:
+                    generate_and_send_summary(config.project_code, "monthly", recipient_emails)

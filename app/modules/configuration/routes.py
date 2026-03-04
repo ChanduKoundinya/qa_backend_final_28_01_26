@@ -1,3 +1,4 @@
+import re
 import pytz
 import requests
 from datetime import datetime, timezone
@@ -398,3 +399,79 @@ def update_email_toggle():
     except Exception as e:
         db.session.rollback()
         return api_response(message=str(e), status=500)
+
+# app/engine/modules/configuration.py
+
+@config_bp.route('/api/configs/summary-notifications', methods=['GET'])
+@jwt_required()
+def get_summary_notifications():
+    """Fetch the full summary notification settings."""
+    try:
+        claims = get_jwt()
+        project_code = claims.get('project')
+        
+        config = ApiConfig.query.filter_by(name="summary_notification_settings", project_code=project_code).first()
+        
+        # 🟢 FIX: Added recipients array to the default schema
+        default_data = {
+            "summaryEnabled": False,
+            "triggers": [],
+            "recipients": [] 
+        }
+        
+        response_data = config.tools if config and config.tools else default_data
+        return jsonify(response_data), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@config_bp.route('/api/configs/summary-notifications', methods=['POST', 'PUT'])
+@jwt_required()
+@role_required(['superadmin', 'admin'])
+def update_summary_notifications():
+    """
+    Handles Add, Edit, Delete, and Toggles in one go.
+    The frontend sends the entire updated JSON array when 'Save All' is clicked.
+    """
+    try:
+        claims = get_jwt()
+        project_code = claims.get('project')
+        data = request.get_json() 
+        
+        if data is None or "summaryEnabled" not in data or "triggers" not in data:
+            return jsonify({"error": "Invalid schema. Must contain summaryEnabled and triggers array."}), 400
+
+        # 🟢 NEW: Validate Email Formats in the Recipient List
+        if "recipients" in data:
+            email_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
+            for rep in data["recipients"]:
+                email_address = rep.get("email", "").strip()
+                if not re.match(email_regex, email_address):
+                    return jsonify({"error": f"Invalid email format detected: '{email_address}'"}), 400
+
+        config = ApiConfig.query.filter_by(name="summary_notification_settings", project_code=project_code).first()
+        
+        if not config:
+            config = ApiConfig(
+                name="summary_notification_settings",
+                category="Notification Settings",
+                project_code=project_code
+            )
+            db.session.add(config)
+        
+        # Overwrite the JSONB 'tools' column with the exact frontend payload
+        config.tools = data 
+        # Update the simple 'key' for quick global status checks
+        config.key = "true" if data.get("summaryEnabled") else "false"
+        config.updated_at = get_utc_now()
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Summary notification triggers saved successfully", 
+            "data": config.tools
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
