@@ -20,7 +20,7 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
     time_cols = ['Closed Time', 'Created Time', 'Due by Time', 'Resolved Time', 'Last Updated Time']
     for col in time_cols:
         if col in df.columns:
-            # 🟢 NEW: Use format='mixed' to force Pandas to read '12/1/2025 0:47' correctly
+            # Parse the dates with mixed format
             try:
                 df[col] = pd.to_datetime(df[col], errors='coerce', format='mixed')
             except ValueError:
@@ -28,9 +28,12 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
                 df[col] = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
             
             if not df[col].isna().all():
-                if df[col].dt.tz is None:
-                    df[col] = df[col].dt.tz_localize('UTC') 
-                df[col] = df[col].dt.tz_convert(user_tz)   
+                # 🟢 FIX: Stop blindly adding +5:30 to dates that are already local!
+                # ONLY apply timezone conversion if the raw data explicitly declares a timezone (e.g., ending in "Z")
+                if df[col].dt.tz is not None:
+                    df[col] = df[col].dt.tz_convert(user_tz)
+                
+                # Strip timezone so the rest of the Pandas charts work smoothly
                 df[col] = df[col].dt.tz_localize(None)
 
     for col in ['First Response Time (in Hrs)', 'Resolution Time (in Hrs)']:
@@ -56,8 +59,9 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         df['FCR'] = 0
 
     if 'Status' in df.columns:
-        active_statuses = ['Open', 'New', 'In Progress', 'Pending', 'Active', 'Unassigned', 'Waiting On Customer']
-        df_open = df[df['Status'].isin(active_statuses)].copy()
+        # 🟢 FIX: Use a blocklist to keep ALL tickets unless they are fully closed
+        inactive_statuses = ['Resolved', 'Closed', 'Cancelled', 'Canceled']
+        df_open = df[~df['Status'].isin(inactive_statuses)].copy()
     else:
         df_open = pd.DataFrame()
     
@@ -119,20 +123,20 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
     
     # 1. Top Talkers (UPDATED TO CATEGORY BY GROUP)
     if '1' in active_features:
-        # 🟢 Changed the required columns check to look for Category and Group
         if {'Category', 'Group', 'Ticket Id'}.issubset(df.columns) and not df.empty:
             
-            # 🟢 Changed the groupby to use Category and Group
             data = df.groupby(['Category', 'Group'])['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
+            
+            # 🟢 FIX: Explicitly limit the data to only the top 10 rows
+            data = data.head(10)
             
             data.to_excel(writer, sheet_name='1_Top_Talkers', index=False)
             
-            # 🟢 Updated the chart title to match the new data
-            add_chart('1_Top_Talkers', data, 2, 'Top Categories by Group')
+            # Updated chart title to reflect the Top 10
+            add_chart('1_Top_Talkers', data, 2, 'Top 10 Categories by Group')
         else:
-            # 🟢 Updated the error message
             write_dummy_data('1_Top_Talkers', 'Missing Category/Group columns or empty data')
-                    
+
     # 2. Closed Trend (UPDATED TO DAILY TREND)
     if '2' in active_features:
         if not df_closed.empty and global_time_col:
@@ -144,15 +148,21 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         else:
             write_dummy_data('2_Closed_Trend', 'Missing valid dates in both Closed Time and Resolved Time columns.')
 
-    # 3. Agent Rank (UPDATED TO SORT BY HIGHEST COUNT)
     if '3' in active_features:
-        if {'Group', 'Agent', 'Ticket Id'}.issubset(df.columns) and not df.empty:
-            # 🟢 Added .sort_values() to rank from highest to lowest
-            data = df.groupby(['Group', 'Agent'])['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
+        if 'Agent' in df.columns and not df.empty:
+            
+            # 🟢 FIX: Group strictly by 'Agent' only. 'Group' is completely removed.
+            data = df.groupby('Agent')['Ticket Id'].count().reset_index(name='Count').sort_values('Count', ascending=False)
+            
+            # Optional: If you only want the Top 10 or Top 20 agents, use .head() 
+            # data = data.head(10)
+            
             data.to_excel(writer, sheet_name='3_Agent_Rank', index=False)
-            add_chart('3_Agent_Rank', data, 2, 'Agent Volume by Group')
+            
+            # Update the chart title to reflect the flat list
+            add_chart('3_Agent_Rank', data, 1, 'Overall Agent Volume Ranking')
         else:
-            write_dummy_data('3_Agent_Rank', 'Missing Group/Agent columns')
+            write_dummy_data('3_Agent_Rank', 'Missing Agent column')
 
     # 4. Response Time
     if '4' in active_features:
@@ -199,26 +209,22 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
         else:
             write_dummy_data('7_MTTR', 'Missing Resolution Time data')
 
-    # 8. Open Trend (UPDATED TO DAILY TREND)
+    # 8. Opening Trend (UPDATED TO TICKETS CREATED PER DAY)
     if '8' in active_features:
-        if 'Created Time' in df.columns and not df.empty:
-            start_date = df['Created Time'].min()
-            if pd.notna(start_date):
-                # 🟢 Changed freq='ME' to freq='D' to generate a list of every single day
-                days = pd.date_range(start=start_date, end=current_date, freq='D')
-                
-                # Check how many tickets were open on each specific day
-                counts = [((df['Created Time'] <= d) & ((df['Closed Time'] > d) | df['Closed Time'].isnull())).sum() for d in days]
-                
-                # 🟢 Changed column name to 'Date' and format to YYYY-MM-DD
-                data = pd.DataFrame({'Date': [d.strftime('%Y-%m-%d') for d in days], 'Open Tickets': counts})
-                
-                data.to_excel(writer, sheet_name='8_Open_Trend', index=False)
-                add_chart('8_Open_Trend', data, 1, 'Daily Open Backlog Trend', 'line')
-            else:
-                write_dummy_data('8_Open_Trend', 'Invalid dates in Created Time')
+        if 'Created Time' in df.columns and not df['Created Time'].isna().all():
+            # 🟢 FIX: Group strictly by the creation date to find total tickets opened each day
+            df_created = df[df['Created Time'].notnull()].copy()
+            df_created['Date'] = df_created['Created Time'].dt.strftime('%Y-%m-%d')
+            
+            # Count the total incoming volume for that day
+            data = df_created.groupby('Date')['Ticket Id'].count().reset_index(name='Tickets Created')
+            
+            data.to_excel(writer, sheet_name='8_Open_Trend', index=False)
+            
+            # Update the chart title to match the functional spec
+            add_chart('8_Open_Trend', data, 1, 'Daily Opening Trend', 'line')
         else:
-            write_dummy_data('8_Open_Trend', 'Missing Created Time column')
+            write_dummy_data('8_Open_Trend', 'Missing valid dates in Created Time column')
 
     # 9. Automation
     if '9' in active_features:
