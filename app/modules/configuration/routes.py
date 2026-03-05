@@ -8,6 +8,8 @@ import logging
 from app.decorators import role_required
 from flask_jwt_extended import jwt_required, get_jwt
 import uuid
+import time
+from sqlalchemy.orm.attributes import flag_modified
 
 # 🟢 POSTGRESQL MODELS IMPORT
 from app.models import db, ApiConfig, Criterion
@@ -401,77 +403,209 @@ def update_email_toggle():
         return api_response(message=str(e), status=500)
 
 # app/engine/modules/configuration.py
+# =====================================================================
+# 🟢 DAILY SUMMARY NOTIFICATION CRUD SETTINGS
+# =====================================================================
 
-@config_bp.route('/api/configs/summary-notifications', methods=['GET'])
-@jwt_required()
-def get_summary_notifications():
-    """Fetch the full summary notification settings."""
-    try:
-        claims = get_jwt()
-        project_code = claims.get('project')
-        
-        config = ApiConfig.query.filter_by(name="summary_notification_settings", project_code=project_code).first()
-        
-        # 🟢 FIX: Added recipients array to the default schema
-        default_data = {
-            "summaryEnabled": False,
-            "triggers": [],
-            "recipients": [] 
-        }
-        
-        response_data = config.tools if config and config.tools else default_data
-        return jsonify(response_data), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@config_bp.route('/api/configs/summary-notifications', methods=['POST', 'PUT'])
-@jwt_required()
-@role_required(['superadmin', 'admin'])
-def update_summary_notifications():
-    """
-    Handles Add, Edit, Delete, and Toggles in one go.
-    The frontend sends the entire updated JSON array when 'Save All' is clicked.
-    """
-    try:
-        claims = get_jwt()
-        project_code = claims.get('project')
-        data = request.get_json() 
-        
-        if data is None or "summaryEnabled" not in data or "triggers" not in data:
-            return jsonify({"error": "Invalid schema. Must contain summaryEnabled and triggers array."}), 400
-
-        # 🟢 NEW: Validate Email Formats in the Recipient List
-        if "recipients" in data:
-            email_regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-            for rep in data["recipients"]:
-                email_address = rep.get("email", "").strip()
-                if not re.match(email_regex, email_address):
-                    return jsonify({"error": f"Invalid email format detected: '{email_address}'"}), 400
-
-        config = ApiConfig.query.filter_by(name="summary_notification_settings", project_code=project_code).first()
-        
-        if not config:
-            config = ApiConfig(
-                name="summary_notification_settings",
-                category="Notification Settings",
-                project_code=project_code
-            )
-            db.session.add(config)
-        
-        # Overwrite the JSONB 'tools' column with the exact frontend payload
-        config.tools = data 
-        # Update the simple 'key' for quick global status checks
-        config.key = "true" if data.get("summaryEnabled") else "false"
-        config.updated_at = get_utc_now()
-        
+def get_summary_config(project_code):
+    """Helper to fetch or create the summary config document to prevent crashes."""
+    config = ApiConfig.query.filter_by(name="summary_notification_settings", project_code=project_code).first()
+    if not config:
+        config = ApiConfig(
+            name="summary_notification_settings", 
+            category="Notification Settings",
+            project_code=project_code,
+            key="false",
+            tools={"summaryEnabled": False, "recipients": [], "triggers": []}
+        )
+        db.session.add(config)
         db.session.commit()
         
-        return jsonify({
-            "message": "Summary notification triggers saved successfully", 
-            "data": config.tools
-        }), 200
+    if not config.tools:
+        config.tools = {"summaryEnabled": False, "recipients": [], "triggers": []}
         
-    except Exception as e:
-        db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+    return config
+
+# --- 1. Master Toggle ---
+@config_bp.route('/api/configs/summary-toggle', methods=['GET'])
+@jwt_required()
+def get_summary_toggle():
+    claims = get_jwt()
+    config = get_summary_config(claims.get('project'))
+    
+    return jsonify({
+        "status": "success",
+        "data": {
+            "summaryEnabled": config.tools.get("summaryEnabled", False)
+        }
+    }), 200
+
+@config_bp.route('/api/configs/summary-toggle', methods=['POST'])
+@jwt_required()
+def update_summary_toggle():
+    claims = get_jwt()
+    data = request.get_json()
+    config = get_summary_config(claims.get('project'))
+    
+    is_enabled = data.get("summaryEnabled", False)
+    config.tools["summaryEnabled"] = is_enabled
+    config.key = "true" if is_enabled else "false"  # Keep global key in sync for the Cron job
+    
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"status": "success"}), 200
+
+# --- 2. Recipients CRUD ---
+@config_bp.route('/api/notifications/recipients', methods=['GET'])
+@jwt_required()
+def get_recipients():
+    claims = get_jwt()
+    config = get_summary_config(claims.get('project'))
+    return jsonify(config.tools.get("recipients", [])), 200
+
+@config_bp.route('/api/notifications/recipients', methods=['POST'])
+@jwt_required()
+def add_recipient():
+    claims = get_jwt()
+    data = request.get_json()
+    config = get_summary_config(claims.get('project'))
+    
+    new_recipient = {
+        "id": f"rec_{uuid.uuid4().hex[:6]}",
+        "name": data.get("name", "Unknown"),
+        "email": data.get("email", "")
+    }
+    
+    recipients = config.tools.get("recipients", [])
+    recipients.append(new_recipient)
+    config.tools["recipients"] = recipients
+    
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"message": "Recipient created", "recipient": new_recipient}), 201
+
+@config_bp.route('/api/notifications/recipients/<recipient_id>', methods=['PUT'])
+@jwt_required()
+def edit_recipient(recipient_id):
+    claims = get_jwt()
+    data = request.get_json()
+    config = get_summary_config(claims.get('project'))
+    
+    recipients = config.tools.get("recipients", [])
+    for rec in recipients:
+        if rec["id"] == recipient_id:
+            rec["name"] = data.get("name", rec.get("name"))
+            rec["email"] = data.get("email", rec.get("email"))
+            break
+            
+    config.tools["recipients"] = recipients
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"status": "success"}), 200
+
+@config_bp.route('/api/notifications/recipients/<recipient_id>', methods=['DELETE'])
+@jwt_required()
+def delete_recipient(recipient_id):
+    claims = get_jwt()
+    config = get_summary_config(claims.get('project'))
+    
+    recipients = config.tools.get("recipients", [])
+    config.tools["recipients"] = [r for r in recipients if r["id"] != recipient_id]
+    
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"status": "success"}), 200
+
+# --- 3. Triggers CRUD ---
+@config_bp.route('/api/notifications/triggers', methods=['GET'])
+@jwt_required()
+def get_triggers():
+    claims = get_jwt()
+    config = get_summary_config(claims.get('project'))
+    
+    return jsonify({
+        "summaryEnabled": config.tools.get("summaryEnabled", False),
+        "triggers": config.tools.get("triggers", [])
+    }), 200
+
+@config_bp.route('/api/notifications/triggers', methods=['POST'])
+@jwt_required()
+def add_trigger():
+    claims = get_jwt()
+    data = request.get_json()
+    config = get_summary_config(claims.get('project'))
+    
+    now_ms = int(time.time() * 1000)
+    now_str = datetime.now().strftime("%b %d, %Y, %I:%M %p")
+    
+    new_trigger = {
+        "id": now_ms,
+        "status": data.get("status", True),
+        "frequency": data.get("frequency"),
+        "time": data.get("time"),
+        "dayOfWeek": data.get("dayOfWeek"),
+        "timezone": data.get("timezone", "UTC"),
+        "dateOfMonth": data.get("dateOfMonth"),
+        "detail": data.get("detail", ""),
+        "emails": data.get("emails", []),
+        "createdBy": data.get("createdBy", claims.get("username", "Admin")),
+        "createdAt": now_str,
+        "modifiedAt": now_str
+    }
+    
+    triggers = config.tools.get("triggers", [])
+    triggers.append(new_trigger)
+    config.tools["triggers"] = triggers
+    
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"message": "Trigger created successfully", "trigger": new_trigger}), 201
+
+@config_bp.route('/api/notifications/triggers/<trigger_id>', methods=['PUT'])
+@jwt_required()
+def edit_trigger(trigger_id):
+    claims = get_jwt()
+    data = request.get_json()
+    config = get_summary_config(claims.get('project'))
+    now_str = datetime.now().strftime("%b %d, %Y, %I:%M %p")
+    
+    triggers = config.tools.get("triggers", [])
+    for trig in triggers:
+        if str(trig["id"]) == str(trigger_id):
+            trig.update({
+                "status": data.get("status", trig.get("status")),
+                "timezone": data.get("timezone", trig.get("timezone", "UTC")),
+                "frequency": data.get("frequency", trig.get("frequency")),
+                "time": data.get("time", trig.get("time")),
+                "dayOfWeek": data.get("dayOfWeek", trig.get("dayOfWeek")),
+                "dateOfMonth": data.get("dateOfMonth", trig.get("dateOfMonth")),
+                "detail": data.get("detail", trig.get("detail")),
+                "emails": data.get("emails", trig.get("emails")),
+                "modifiedAt": now_str
+            })
+            break
+            
+    config.tools["triggers"] = triggers
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"status": "success"}), 200
+
+@config_bp.route('/api/notifications/triggers/<trigger_id>', methods=['DELETE'])
+@jwt_required()
+def delete_trigger(trigger_id):
+    claims = get_jwt()
+    config = get_summary_config(claims.get('project'))
+    
+    triggers = config.tools.get("triggers", [])
+    config.tools["triggers"] = [t for t in triggers if str(t["id"]) != str(trigger_id)]
+    
+    flag_modified(config, "tools")
+    db.session.commit()
+    
+    return jsonify({"status": "success"}), 200

@@ -1074,10 +1074,8 @@ def generate_and_send_summary(project_code, frequency="daily", recipient_list=No
 def evaluate_summary_triggers(app):
     """CRON JOB: Runs every minute and evaluates Daily/Weekly/Monthly triggers."""
     with app.app_context():
-        now = datetime.now()
-        current_time_str = now.strftime("%H:%M") # Format: "09:00"
-        current_day = now.strftime("%A")         # Format: "Friday"
-        current_date = str(now.day)              # Format: "3"
+        # 🟢 GET ABSOLUTE UTC TIME FIRST
+        utc_now = datetime.now(timezone.utc) 
 
         configs = ApiConfig.query.filter_by(name="summary_notification_settings").all()
         
@@ -1091,33 +1089,43 @@ def evaluate_summary_triggers(app):
 
             triggers = settings.get("triggers", [])
             
-            # 🟢 NEW: Extract exactly the emails saved in the frontend list
-            raw_recipients = settings.get("recipients", [])
-            recipient_emails = [r.get("email") for r in raw_recipients if r.get("email")]
-
-            # If the list is empty, don't bother calculating anything
-            if not recipient_emails:
-                logging.warning(f"⚠️ No recipients configured for project {config.project_code}. Skipping summary.")
-                continue
-            
             for t in triggers:
                 if not t.get("status"): 
                     continue 
-                    
+
+                # =========================================================
+                # 🟢 TIMEZONE MAGIC HAPPENS HERE
+                # =========================================================
+                tz_str = t.get("timezone", "UTC") # Fallback to UTC if missing
+                try:
+                    target_tz = pytz.timezone(tz_str)
+                    local_time = utc_now.astimezone(target_tz)
+                except pytz.UnknownTimeZoneError:
+                    local_time = utc_now # Fallback if timezone string is invalid
+
+                # Now get the time, day, and date IN THAT SPECIFIC TIMEZONE
+                current_time_str = local_time.strftime("%H:%M")
+                current_day = local_time.strftime("%A")
+                current_date = str(local_time.day)
+                # =========================================================
+
+                # Now compare the trigger's target time to the LOCALIZED time!
                 if t.get("time") != current_time_str: 
                     continue 
 
                 freq = str(t.get("frequency")).lower()
+                trigger_emails = t.get("emails", [])
                 
-                # 🟢 Pass the recipient_emails array to the generator
+                if not trigger_emails:
+                    continue
+                
+                # Fire the generator!
                 if freq == "daily":
-                    generate_and_send_summary(config.project_code, "daily", recipient_emails)
-                
+                    generate_and_send_summary(config.project_code, "daily", trigger_emails)
                 elif freq == "weekly" and str(t.get("dayOfWeek")).lower() == current_day.lower():
-                    generate_and_send_summary(config.project_code, "weekly", recipient_emails)
-                
+                    generate_and_send_summary(config.project_code, "weekly", trigger_emails)
                 elif freq == "monthly" and str(t.get("dateOfMonth")) == current_date:
-                    generate_and_send_summary(config.project_code, "monthly", recipient_emails)
+                    generate_and_send_summary(config.project_code, "monthly", trigger_emails)
 
 
 # 🟢 NEW ENDPOINT: Core Service sends live progress here (e.g., row 30 of 100 = 30%)
