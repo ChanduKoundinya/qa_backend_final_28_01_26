@@ -62,6 +62,7 @@ class Task(db.Model):
     created_by = db.Column(db.String(80))
     user_tz = db.Column(db.String(50))
     project_code = db.Column(db.String(50), nullable=False)
+    progress = db.Column(db.Integer, default=0)
     
     created_at = db.Column(db.DateTime, default=get_utc_now)
     scheduled_for = db.Column(db.DateTime)

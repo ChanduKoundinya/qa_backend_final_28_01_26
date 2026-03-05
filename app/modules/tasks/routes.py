@@ -66,7 +66,10 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                 logging.info(f"⚙️ Incident Report detected. Processing LOCALLY for Task {task_id}")
                 
                 try:
-                    # Fetch file from Postgres StoredFile
+                    # 🟢 UPDATE PROGRESS: Starting File Read
+                    task.progress = 10
+                    db.session.commit()
+
                     input_file = StoredFile.query.get(task.input_file_id)
                     grid_out = io.BytesIO(input_file.file_data)
                     user_tz = task.user_tz or 'UTC'
@@ -76,8 +79,16 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
                     else:
                         df = pd.read_excel(grid_out)
                     
+                    # 🟢 UPDATE PROGRESS: Generating charts & calculations
+                    task.progress = 50
+                    db.session.commit()
+
                     feat_list = eval(features) if isinstance(features, str) else (features or [])
                     output_bytes = generate_incident_report(df, feat_list, user_tz)
+
+                    # 🟢 UPDATE PROGRESS: Saving final files
+                    task.progress = 85
+                    db.session.commit()
 
                     filename = f"Incident_Report_{task_id}.xlsx"
                     output_bytes.seek(0)
@@ -95,6 +106,7 @@ def run_scheduled_job(task_id, app_instance, project_code, features=None):
 
                     # Update Task
                     task.status = 'complete'
+                    task.progress = 100
                     task.output_excel_id = excel_id
                     task.completed_at = get_utc_now()
                     
@@ -351,7 +363,6 @@ def upload_file():
 @jwt_required()
 def get_task_status(task_id):
     try:
-        # Postgres expects an integer ID
         if not task_id.isdigit():
             return jsonify({'status': 'error', 'error': 'Invalid Task ID format'}), 400
 
@@ -360,9 +371,17 @@ def get_task_status(task_id):
             return jsonify({'status': 'error', 'error': 'Task not found'}), 404
 
         status = task.status
-        response = {'status': status, 'task_id': str(task.id)}
+        
+        # 🟢 ADDED: We now send the uploaded_by username and the live progress percentage!
+        response = {
+            'status': status, 
+            'task_id': str(task.id),
+            'uploaded_by': task.created_by or "Unknown User", 
+            'progress': task.progress if hasattr(task, 'progress') and task.progress else 0
+        }
 
         if status == "complete":
+            response['progress'] = 100  # Force 100% when fully complete
             response['excel_id'] = str(task.output_excel_id) if task.output_excel_id else None
             response['docx_id'] = str(task.output_docx_id) if task.output_docx_id else None
         elif status == "error":
@@ -413,13 +432,19 @@ def api_get_tasks():
                 else:
                     category = 'unknown'
             
+            current_progress = 100 if task.status == 'complete' else (task.progress or 0)
+
             tasks_list.append({
                 '_id': str(task.id),
                 'filename': task.filename or "Batch/Unknown File",
                 'status': task.status,
                 'audit_category': category,
                 'analysis_type': task.analysis_type,
-                'uploaded_by': task.created_by or 'System/Unknown',
+                'uploaded_by': task.created_by or 'System/Unknown', 
+                
+                # 👇 ADD THIS EXACT LINE:
+                'progress': current_progress,
+                
                 'uploaded_at': format_to_iso_z(task.created_at), 
                 'created_at': format_to_iso_z(task.created_at),
                 'scheduled_for': format_to_iso_z(task.scheduled_for),
@@ -1093,3 +1118,35 @@ def evaluate_summary_triggers(app):
                 
                 elif freq == "monthly" and str(t.get("dateOfMonth")) == current_date:
                     generate_and_send_summary(config.project_code, "monthly", recipient_emails)
+
+
+# 🟢 NEW ENDPOINT: Core Service sends live progress here (e.g., row 30 of 100 = 30%)
+@tasks_bp.route('/internal/update-progress', methods=['POST'])
+def update_task_progress():
+    try:
+        data = request.get_json()
+        raw_id = data.get('task_id')
+        progress = data.get('progress', 0)
+
+        if not raw_id:
+            return jsonify({"error": "Missing task_id"}), 400
+
+        # Handle the passport task ID format (ProjectCode___TaskID)
+        if "___" in str(raw_id):
+            _, real_task_id = str(raw_id).split("___", 1)
+        else:
+            real_task_id = raw_id
+
+        task = Task.query.get(int(real_task_id))
+        if not task:
+            return jsonify({"error": "Task not found"}), 404
+
+        # Update the live progress
+        task.progress = int(progress)
+        db.session.commit()
+
+        return jsonify({"status": "success", "progress": task.progress}), 200
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
