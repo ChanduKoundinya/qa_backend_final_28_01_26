@@ -268,11 +268,12 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
     #         write_dummy_data('11_Top_Categories', 'Missing Category column')
 
     # 12. Priority Breakdown
+    # 12. Priority Breakdown
     if '9' in active_features:
         if {'Priority', 'Group', 'Ticket Id'}.issubset(df.columns) and not df.empty:
             
-            # 🟢 FIX: Create a matrix/pivot table (Rows = Group, Columns = Priority)
-            data = df.groupby(['Group', 'Priority'])['Ticket Id'].count().unstack().fillna(0)
+            # 🟢 FIX: Flipped the groupby order so Priority is the X-axis and Group is the Stacked Legend
+            data = df.groupby(['Priority', 'Group'])['Ticket Id'].count().unstack().fillna(0)
             
             # Make the data look nice and flat for Excel
             data = data.reset_index()
@@ -283,7 +284,7 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
             worksheet = writer.sheets['12_Priority_Breakdown']
             chart = workbook.add_chart({'type': 'column', 'subtype': 'stacked'})
             
-            # Loop through however many priority columns there are (e.g., High, Low, Medium)
+            # Loop through however many Group columns there are
             for i in range(1, len(data.columns)):
                 chart.add_series({
                     'name':       ['12_Priority_Breakdown', 0, i],
@@ -336,10 +337,16 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
             write_dummy_data('14_Top_Requesters', 'Missing Requester Name column')
 
     # 12. Top Assets
+
     if '12' in active_features:
         if 'Item' in df.columns and not df.empty:
-            data = df[df['Item'] != '']['Item'].value_counts().head(10).reset_index()
+            # 🟢 FIX: Removed .head(10) to include EVERY asset
+            data = df[df['Item'] != '']['Item'].value_counts().reset_index()
             data.columns = ['Asset/Item', 'Ticket Count']
+            
+            data.to_excel(writer, sheet_name='15_Asset_Tickets', index=False)
+            # You might want to update the chart title too since it's no longer just the "Top 10"
+            add_chart('15_Asset_Tickets', data, 1, 'All Impacted Assets')
             data.to_excel(writer, sheet_name='15_Asset_Tickets', index=False)
             add_chart('15_Asset_Tickets', data, 1, 'Top Impacted Assets')
         else:

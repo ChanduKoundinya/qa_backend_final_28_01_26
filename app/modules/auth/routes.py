@@ -60,6 +60,8 @@ def register():
         password = data['password']  # We don't strip passwords; spaces might be intentional!
         role = data['role'].strip()
         project_code = data['project'].strip()
+        is_active_status = data.get('is_active', True)
+        
 
         # 🟢 2. Validate Email Format using Regex
         email_regex = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
@@ -80,7 +82,7 @@ def register():
             password=hashed_password,
             role=role,
             project_code=project_code,
-            is_active=True,
+            is_active=is_active_status,
             created_at=get_utc_now()
         )
         

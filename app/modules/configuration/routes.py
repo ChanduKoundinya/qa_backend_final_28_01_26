@@ -540,7 +540,8 @@ def add_trigger():
     config = get_summary_config(claims.get('project'))
     
     now_ms = int(time.time() * 1000)
-    now_str = datetime.now().strftime("%b %d, %Y, %I:%M %p")
+    # Use your existing get_utc_now() helper for standard ISO format!
+    now_str = get_utc_now().isoformat().replace("+00:00", "Z")
     
     new_trigger = {
         "id": now_ms,
@@ -572,7 +573,7 @@ def edit_trigger(trigger_id):
     claims = get_jwt()
     data = request.get_json()
     config = get_summary_config(claims.get('project'))
-    now_str = datetime.now().strftime("%b %d, %Y, %I:%M %p")
+    now_str = get_utc_now().isoformat().replace("+00:00", "Z")
     
     triggers = config.tools.get("triggers", [])
     for trig in triggers:
