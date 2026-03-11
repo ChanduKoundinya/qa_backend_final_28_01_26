@@ -36,12 +36,26 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
                 # Strip timezone so the rest of the Pandas charts work smoothly
                 df[col] = df[col].dt.tz_localize(None)
 
+    import re # Make sure this is at the top of your file!
+
     for col in ['First Response Time (in Hrs)', 'Resolution Time (in Hrs)']:
         if col in df.columns:
-            df[col] = pd.to_numeric(
-                df[col].astype(str).str.extract(r'(\d+\.?\d*)', expand=False), 
-                errors='coerce'
-            )
+            def parse_time_to_hours(val):
+                val = str(val).strip()
+                if val.lower() in ['nan', 'none', '']: return pd.NA
+                
+                # 🟢 FIX: Handle HH:MM:SS format correctly
+                if ':' in val:
+                    parts = val.split(':')
+                    if len(parts) == 3:
+                        # Converts 01:30:00 into 1.5 Hours
+                        return float(parts[0]) + (float(parts[1]) / 60) + (float(parts[2]) / 3600)
+                
+                # Fallback for old formats like "1.5 hrs"
+                match = re.search(r'(\d+\.?\d*)', val)
+                return float(match.group(1)) if match else pd.NA
+                
+            df[col] = pd.to_numeric(df[col].apply(parse_time_to_hours), errors='coerce')
 
     text_cols = ['Priority', 'Status', 'Type', 'Group', 'Agent', 'Description', 'Subject', 'Category', 'Requester Name', 'Item']
     for col in text_cols:

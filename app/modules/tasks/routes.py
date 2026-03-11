@@ -17,7 +17,7 @@ from app.engine.incident import generate_incident_report
 from app.engine.reporting import generate_docx_report
 from app.extensions import scheduler
 from . import tasks_bp
-
+from sqlalchemy.orm.attributes import flag_modified
 # 🟢 POSTGRESQL MODELS IMPORT
 from app.models import db, Task, StoredFile, AuditReport, IncidentResult, ApiConfig, Criterion, PiiLog, User, CallAuditResult
 from app.utils.email_service import send_audit_email, trigger_automated_email
@@ -1074,10 +1074,11 @@ def generate_and_send_summary(project_code, frequency="daily", recipient_list=No
 def evaluate_summary_triggers(app):
     """CRON JOB: Runs every minute and evaluates Daily/Weekly/Monthly triggers."""
     with app.app_context():
-        # 🟢 GET ABSOLUTE UTC TIME FIRST
         utc_now = datetime.now(timezone.utc) 
 
-        configs = ApiConfig.query.filter_by(name="summary_notification_settings").all()
+        # 🟢 FIX 1: Add .with_for_update() to lock the rows. 
+        # This forces multiple workers to wait in line rather than querying at the exact same time.
+        configs = ApiConfig.query.filter_by(name="summary_notification_settings").with_for_update().all()
         
         for config in configs:
             if config.key == "false" or not config.tools: 
@@ -1088,36 +1089,42 @@ def evaluate_summary_triggers(app):
                 continue
 
             triggers = settings.get("triggers", [])
+            has_updates = False # Track if we need to save the config
             
             for t in triggers:
                 if not t.get("status"): 
                     continue 
 
-                # =========================================================
-                # 🟢 TIMEZONE MAGIC HAPPENS HERE
-                # =========================================================
-                tz_str = t.get("timezone", "UTC") # Fallback to UTC if missing
+                # Timezone calculations
+                tz_str = t.get("timezone", "UTC")
                 try:
                     target_tz = pytz.timezone(tz_str)
                     local_time = utc_now.astimezone(target_tz)
                 except pytz.UnknownTimeZoneError:
-                    local_time = utc_now # Fallback if timezone string is invalid
+                    local_time = utc_now
 
-                # Now get the time, day, and date IN THAT SPECIFIC TIMEZONE
                 current_time_str = local_time.strftime("%H:%M")
                 current_day = local_time.strftime("%A")
                 current_date = str(local_time.day)
-                # =========================================================
 
-                # Now compare the trigger's target time to the LOCALIZED time!
+                # Check if it's the right time
                 if t.get("time") != current_time_str: 
                     continue 
+
+                # 🟢 FIX 2: Check if another worker already sent this exact minute's email
+                current_minute_stamp = local_time.strftime("%Y-%m-%d %H:%M")
+                if t.get("last_dispatched") == current_minute_stamp:
+                    continue # Skip! Another worker already handled this.
 
                 freq = str(t.get("frequency")).lower()
                 trigger_emails = t.get("emails", [])
                 
                 if not trigger_emails:
                     continue
+                
+                # 🟢 FIX 3: Mark as dispatched immediately
+                t["last_dispatched"] = current_minute_stamp
+                has_updates = True
                 
                 # Fire the generator!
                 if freq == "daily":
@@ -1126,6 +1133,14 @@ def evaluate_summary_triggers(app):
                     generate_and_send_summary(config.project_code, "weekly", trigger_emails)
                 elif freq == "monthly" and str(t.get("dateOfMonth")) == current_date:
                     generate_and_send_summary(config.project_code, "monthly", trigger_emails)
+
+            # 🟢 FIX 4: Save the 'last_dispatched' timestamps back to the DB to notify other workers
+            if has_updates:
+                flag_modified(config, "tools")
+                db.session.commit()
+            else:
+                # Always commit to release the .with_for_update() row lock safely
+                db.session.commit()
 
 
 # 🟢 NEW ENDPOINT: Core Service sends live progress here (e.g., row 30 of 100 = 30%)
