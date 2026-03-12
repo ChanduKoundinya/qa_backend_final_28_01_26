@@ -281,8 +281,8 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
     #     else:
     #         write_dummy_data('11_Top_Categories', 'Missing Category column')
 
-    # 12. Priority Breakdown
-    # 12. Priority Breakdown
+    
+    # 9. Priority Breakdown
     if '9' in active_features:
         if {'Priority', 'Group', 'Ticket Id'}.issubset(df.columns) and not df.empty:
             
@@ -292,27 +292,27 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
             # Make the data look nice and flat for Excel
             data = data.reset_index()
             
-            data.to_excel(writer, sheet_name='12_Priority_Breakdown', index=False)
+            data.to_excel(writer, sheet_name='9_Priority_Breakdown', index=False)
             
             # Build a stacked bar chart to visualize the matrix
-            worksheet = writer.sheets['12_Priority_Breakdown']
+            worksheet = writer.sheets['9_Priority_Breakdown']
             chart = workbook.add_chart({'type': 'column', 'subtype': 'stacked'})
             
             # Loop through however many Group columns there are
             for i in range(1, len(data.columns)):
                 chart.add_series({
-                    'name':       ['12_Priority_Breakdown', 0, i],
-                    'categories': ['12_Priority_Breakdown', 1, 0, len(data), 0],
-                    'values':     ['12_Priority_Breakdown', 1, i, len(data), i],
+                    'name':       ['9_Priority_Breakdown', 0, i],
+                    'categories': ['9_Priority_Breakdown', 1, 0, len(data), 0],
+                    'values':     ['9_Priority_Breakdown', 1, i, len(data), i],
                 })
             
             chart.set_title({'name': 'Priority Breakdown by Group'})
             worksheet.insert_chart('G2', chart)
             
         else:
-            write_dummy_data('12_Priority_Breakdown', 'Missing Priority or Group columns')
+            write_dummy_data('9_Priority_Breakdown', 'Missing Priority or Group columns')
 
-    # 13. Arrival Pattern
+    # 10. Arrival Pattern
     if '10' in active_features:
         if 'Created Time' in df.columns and not df.empty:
             try:
@@ -321,34 +321,34 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
                 df['Day'] = pd.Categorical(df['Created Time'].dt.day_name(), categories=days_order, ordered=True)
                 
                 arrival_matrix = df.groupby(['Day', 'Hour'])['Ticket Id'].count().unstack().fillna(0)
-                arrival_matrix.to_excel(writer, sheet_name='13_Arrival_Pattern')
+                arrival_matrix.to_excel(writer, sheet_name='10Arrival_Pattern')
                 
                 hour_summary = df.groupby('Hour')['Ticket Id'].count().reset_index(name='Total Tickets')
-                hour_summary.to_excel(writer, sheet_name='13_Arrival_Pattern', startrow=10, index=False)
+                hour_summary.to_excel(writer, sheet_name='10_Arrival_Pattern', startrow=10, index=False)
                 
-                worksheet = writer.sheets['13_Arrival_Pattern']
+                worksheet = writer.sheets['10_Arrival_Pattern']
                 chart = workbook.add_chart({'type': 'line'})
                 chart.add_series({
-                    'categories': ['13_Arrival_Pattern', 11, 0, 11 + 23, 0],
-                    'values':     ['13_Arrival_Pattern', 11, 1, 11 + 23, 1],
+                    'categories': ['10_Arrival_Pattern', 11, 0, 11 + 23, 0],
+                    'values':     ['10_Arrival_Pattern', 11, 1, 11 + 23, 1],
                     'name': 'Global Hourly Arrival Pattern'
                 })
                 chart.set_title({'name': 'Hourly Ticket Volume (Rush Hour)'})
                 worksheet.insert_chart('G12', chart)
             except Exception:
-                write_dummy_data('13_Arrival_Pattern', 'Error processing date data')
+                write_dummy_data('10_Arrival_Pattern', 'Error processing date data')
         else:
-            write_dummy_data('13_Arrival_Pattern', 'Missing Created Time column')
+            write_dummy_data('10_Arrival_Pattern', 'Missing Created Time column')
 
     # 11. Top Requesters
     if '11' in active_features:
         if 'Requester Name' in df.columns and not df.empty:
             data = df['Requester Name'].value_counts().head(10).reset_index()
             data.columns = ['User Name', 'Ticket Count']
-            data.to_excel(writer, sheet_name='14_Top_Requesters', index=False)
-            add_chart('14_Top_Requesters', data, 1, 'Top 10 Ticket Creators')
+            data.to_excel(writer, sheet_name='11_Top_Requesters', index=False)
+            add_chart('11_Top_Requesters', data, 1, 'Top 10 Ticket Creators')
         else:
-            write_dummy_data('14_Top_Requesters', 'Missing Requester Name column')
+            write_dummy_data('11_Top_Requesters', 'Missing Requester Name column')
 
     # 12. Top Assets
 
@@ -358,32 +358,32 @@ def generate_incident_report(df: pd.DataFrame, active_features: list, user_tz: s
             data = df[df['Item'] != '']['Item'].value_counts().reset_index()
             data.columns = ['Asset/Item', 'Ticket Count']
             
-            data.to_excel(writer, sheet_name='15_Asset_Tickets', index=False)
+            data.to_excel(writer, sheet_name='12_Asset_Tickets', index=False)
             # You might want to update the chart title too since it's no longer just the "Top 10"
-            add_chart('15_Asset_Tickets', data, 1, 'All Impacted Assets')
-            data.to_excel(writer, sheet_name='15_Asset_Tickets', index=False)
-            add_chart('15_Asset_Tickets', data, 1, 'Top Impacted Assets')
+            add_chart('12_Asset_Tickets', data, 1, 'All Impacted Assets')
+            data.to_excel(writer, sheet_name='12_Asset_Tickets', index=False)
+            add_chart('12_Asset_Tickets', data, 1, 'Top Impacted Assets')
         else:
-            write_dummy_data('15_Asset_Tickets', 'Missing Item column')
+            write_dummy_data('12_Asset_Tickets', 'Missing Item column')
 
     # 13. Type Split
     if '13' in active_features:
         if 'Type' in df.columns and not df.empty:
             data = df['Type'].value_counts().reset_index()
             data.columns = ['Ticket Type', 'Count']
-            data.to_excel(writer, sheet_name='16_Type_Split', index=False)
-            add_chart('16_Type_Split', data, 1, 'Incident vs Service Request', 'pie')
+            data.to_excel(writer, sheet_name='13_Type_Split', index=False)
+            add_chart('13_Type_Split', data, 1, 'Incident vs Service Request', 'pie')
         else:
-            write_dummy_data('16_Type_Split', 'Missing Type column')
+            write_dummy_data('13_Type_Split', 'Missing Type column')
 
     # 14. Closure by Priority
     if '14' in active_features:
         if 'Resolution Time (in Hrs)' in df.columns and 'Priority' in df.columns and not df.empty:
             data = df.groupby('Priority')['Resolution Time (in Hrs)'].mean().reset_index(name='Avg Closure (Hrs)')
-            data.to_excel(writer, sheet_name='17_Closure_By_Priority', index=False)
-            add_chart('17_Closure_By_Priority', data, 1, 'Avg Closure Time (Hrs)')
+            data.to_excel(writer, sheet_name='14_Closure_By_Priority', index=False)
+            add_chart('14_Closure_By_Priority', data, 1, 'Avg Closure Time (Hrs)')
         else:
-            write_dummy_data('17_Closure_By_Priority', 'Missing Resolution Time or Priority columns')
+            write_dummy_data('14_Closure_By_Priority', 'Missing Resolution Time or Priority columns')
 
     # --- 5. Dashboard & Save ---
     # dash = pd.DataFrame({'Metric': ['Total Tickets', 'Open', 'Closed', 'MTTR (Hrs)'], 
