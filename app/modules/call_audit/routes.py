@@ -161,6 +161,22 @@ def upload_call_audit():
         if not files:
             return jsonify({"error": "No audio files provided"}), 400
 
+        MIN_FILE_SIZE_BYTES = 1024  # 1 KB minimum (A 0-second file is usually < 100 bytes)
+        
+        for f in files:
+            f.stream.seek(0, os.SEEK_END)  # Go to end of file
+            file_size = f.stream.tell()    # Get the byte size
+            f.stream.seek(0)               # CRITICAL: Reset pointer back to beginning
+            
+            if file_size < MIN_FILE_SIZE_BYTES:
+                logging.warning(f"⚠️ Rejected empty file upload: {f.filename}")
+                return jsonify({
+                    "error": f"The file '{f.filename}' is empty or too short. Please upload a valid audio file."
+                }), 400
+        # ==========================================
+
+        logging.info(f"📥 [Bulk Upload] Received {len(files)} valid audio files.")
+
         logging.info(f"📥 [Bulk Upload] Received {len(files)} audio files.")
 
         # 3. Prepare Common Data
